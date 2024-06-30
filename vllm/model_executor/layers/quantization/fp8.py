@@ -1,4 +1,4 @@
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch.nn import Module
@@ -31,6 +31,7 @@ class Fp8Config(QuantizationConfig):
         self,
         is_checkpoint_fp8_serialized: bool = False,
         activation_scheme: str = "dynamic",
+        quant_source: str = "default",
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -40,6 +41,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(
                 f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        self.quant_source = quant_source
 
     @classmethod
     def get_name(cls) -> str:
@@ -62,17 +64,30 @@ class Fp8Config(QuantizationConfig):
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = ("fp8" in quant_method)
         activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
+        quant_source = "default"
+        if is_checkpoint_fp8_serialized and "static" in activation_scheme:
+            quant_source = cls.get_from_keys(config, ["quant_source"])
         return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
-                   activation_scheme=activation_scheme)
+                   activation_scheme=activation_scheme,
+                   quant_source=quant_source)
 
     def get_quant_method(
             self, layer: torch.nn.Module) -> Optional["QuantizeMethodBase"]:
         from vllm.attention.layer import Attention  # Avoid circular import
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptFp8LinearMethod)
 
+        quant_source = self.quant_source
+        quant_source_dicts = {
+            "default": [Fp8LinearMethod, Fp8KVCacheMethod],
+            "modelopt": [ModelOptFp8LinearMethod, Fp8KVCacheMethod],
+            "neural_magic": [Fp8LinearMethod, Fp8KVCacheMethod],
+        }
+        
         if isinstance(layer, LinearBase):
-            return Fp8LinearMethod(self)
+            return quant_source_dicts[quant_source][0](self)
         if isinstance(layer, Attention):
-            return Fp8KVCacheMethod(self)
+            return quant_source_dicts[quant_source][1](self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -111,12 +126,13 @@ class Fp8LinearMethod(LinearMethodBase):
         scale = Parameter(torch.empty(len(output_partition_sizes),
                                       dtype=torch.float32),
                           requires_grad=False)
-        scale[:] = torch.finfo(torch.float8_e4m3fn).min
         layer.register_parameter(scale_name, scale)
-        set_weight_attrs(scale, {
-            **extra_weight_attrs,
-            "needs_scalar_to_array": True,
-        })
+        set_weight_attrs(
+            scale, {
+                **extra_weight_attrs,
+                "fp8_scales_shard_indexer":
+                self.scales_shard_indexer,
+            })
 
     def create_weights(
         self,
@@ -167,6 +183,22 @@ class Fp8LinearMethod(LinearMethodBase):
                     output_partition_sizes=output_partition_sizes,
                     **extra_weight_attrs)
 
+    def scales_shard_indexer(
+            self, param: torch.Tensor, loaded_weight: torch.Tensor,
+            shard_id: Union[str, int]) -> Tuple[torch.Tensor, torch.Tensor]:
+        qkv_idxs = {"q": 0, "k": 1, "v": 2}
+
+        if isinstance(shard_id, int):
+            pass
+        elif isinstance(shard_id, str):
+            if shard_id not in qkv_idxs:
+                raise ValueError(f"Unknown shard_id: {shard_id}")
+            shard_id = qkv_idxs[shard_id]
+        else:
+            ValueError(f"Shard id must be int or str but got {type(shard_id)}")
+
+        return param[shard_id], loaded_weight
+
     def process_weights_after_loading(self, layer: Module) -> None:
         if (not hasattr(layer, "process_after_load")
                 or not layer.process_after_load):
@@ -188,27 +220,15 @@ class Fp8LinearMethod(LinearMethodBase):
             # WEIGHT_SCALE / WEIGHT
             #   Loop over logical weights, requantizing with single scale.
             max_w_scale = layer.weight_scale.max()
+            start = 0
+            for idx, logical_width in enumerate(layer.logical_widths):
+                end = start + logical_width
+                weight_dq = per_tensor_dequantize(layer.weight[start:end, :],
+                                                  layer.weight_scale[idx])
 
-            # QKV / MLP is fused in the on disk checkpoint if any of the
-            # weight scales are still set to the default since we initialize
-            # N weight scales for N shards but we only load 1 weight scale
-            # from disk in this case. As a result, we skip dequant -> requant
-            # since we already have quantized QKV together.
-            # Sample Model with fused checkpoint:
-            #   * nm-testing/Phi-3-mini-128k-instruct-FP8
-            unfused_module_in_checkpoint = (
-                layer.weight_scale[-1] > torch.finfo(torch.float8_e4m3fn).min)
-
-            if unfused_module_in_checkpoint:
-                start = 0
-                for idx, logical_width in enumerate(layer.logical_widths):
-                    end = start + logical_width
-                    weight_dq = per_tensor_dequantize(
-                        layer.weight[start:end, :], layer.weight_scale[idx])
-
-                    layer.weight[start:end, :] = per_tensor_quantize(
-                        weight_dq, layer.weight_scale.max())
-                    start = end
+                layer.weight[start:end, :] = per_tensor_quantize(
+                    weight_dq, layer.weight_scale.max())
+                start = end
             layer.weight_scale = Parameter(max_w_scale, requires_grad=False)
 
             # WEIGHT
@@ -222,6 +242,10 @@ class Fp8LinearMethod(LinearMethodBase):
             if self.quant_config.activation_scheme == "dynamic":
                 layer.input_scale = None
             elif self.quant_config.activation_scheme == "static":
+                if not all_close_1d(layer.input_scale):
+                    raise ValueError(
+                        "All the input_scales for the logical weights of a "
+                        f"layer must be equal. But got {layer.input_scale}")
                 layer.input_scale = Parameter(layer.input_scale.max(),
                                               requires_grad=False)
             else:
@@ -306,6 +330,11 @@ class Fp8KVCacheMethod(QuantizeMethodBase):
                     "cause accuracy issues. Please make sure kv-cache scaling "
                     "factor is available in the fp8 checkpoint.")
         del layer.kv_scale
+
+
+def all_close_1d(x: torch.Tensor) -> bool:
+    assert len(x.shape) == 1
+    return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
 
 
 def per_tensor_quantize(tensor: torch.Tensor,
