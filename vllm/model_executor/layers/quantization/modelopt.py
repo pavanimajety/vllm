@@ -10,7 +10,6 @@ from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
                                                          cutlass_fp8_supported,
                                                          per_tensor_quantize, 
-                                                         all_close_1d,
                                                          apply_quantize)
 from vllm.model_executor.utils import set_weight_attrs
 
@@ -130,11 +129,8 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             layer.input_scale = None
             return
 
-        # If checkpoint is fp8, requantize the separately quantized logical
-        # weights into a single fp8 weight with a single weight scale.
         else:
             # WEIGHT_SCALE / WEIGHT
-            #   Loop over logical weights, requantizing with single scale.
             # Convert the given weight to fp8 because model opt generates
             # quantization scales, but doesn't convert then to fp8.
             layer.weight_scale = layer.weight_quantizer._amax / 448
@@ -155,22 +151,13 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             # WEIGHT
             #   Transpose weight for passing to torch._scaled_mm
             layer.weight = Parameter(weight.t(), requires_grad=False)
-
-            # INPUT ACTIVATION SCALE
-            #   Dynamic: set to None (required input to ops.scaled_fp8_quant).
-            #   Static:  set to max of the input_scales (since they are equal).
+            
             if self.quant_config.activation_scheme == "static":
-                layer.input_scale = layer.input_quantizer._amax
-                if not all_close_1d(layer.input_scale):
-                    raise ValueError(
-                        "All the input_scales for the logical weights of a "
-                        f"layer must be equal. But got {layer.input_scale}")
-                layer.input_scale = Parameter(layer.input_scale.max(),
+                layer.input_scale = Parameter(layer.input_quantizer._amax.max(),
                                               requires_grad=False)
             else:
                 raise ValueError(
-                    f"Unsupported scheme {self.quant_config.activation_scheme} "
-                    "for Model Optimizer weights")
+                    f"Unknown scheme {self.quant_config.activation_scheme}")
 
     def apply(
         self,
