@@ -31,6 +31,7 @@ class Fp8Config(QuantizationConfig):
         self,
         is_checkpoint_fp8_serialized: bool = False,
         activation_scheme: str = "dynamic",
+        quant_source: str = "default",
     ) -> None:
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
         if is_checkpoint_fp8_serialized:
@@ -40,6 +41,7 @@ class Fp8Config(QuantizationConfig):
             raise ValueError(
                 f"Unsupported activation scheme {activation_scheme}")
         self.activation_scheme = activation_scheme
+        self.quant_source = quant_source
 
     @classmethod
     def get_name(cls) -> str:
@@ -61,18 +63,33 @@ class Fp8Config(QuantizationConfig):
     def from_config(cls, config: Dict[str, Any]) -> "Fp8Config":
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_fp8_serialized = ("fp8" in quant_method)
-        activation_scheme = cls.get_from_keys(config, ["activation_scheme"])
-        return cls(is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
-                   activation_scheme=activation_scheme)
+        activation_scheme = cls.get_from_keys(config, ["activation_scheme"]) 
+        quant_source = "default"
+        if is_checkpoint_fp8_serialized and "static" in activation_scheme:
+            quant_source = cls.get_from_keys(config, ["quant_source"])
+        return cls(
+            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            activation_scheme=activation_scheme,
+            quant_source=quant_source,
+        )
 
     def get_quant_method(
             self, layer: torch.nn.Module) -> Optional["QuantizeMethodBase"]:
         from vllm.attention.layer import Attention  # Avoid circular import
+        from vllm.model_executor.layers.quantization.modelopt import (
+            ModelOptFp8LinearMethod)
+
+        quant_source = self.quant_source
+        quant_source_dicts = {
+            "default": [Fp8LinearMethod, Fp8KVCacheMethod],
+            "modelopt": [ModelOptFp8LinearMethod, Fp8KVCacheMethod],
+            "neural_magic": [Fp8LinearMethod, Fp8KVCacheMethod],
+        }
 
         if isinstance(layer, LinearBase):
-            return Fp8LinearMethod(self)
+            return quant_source_dicts[quant_source][0](self)
         if isinstance(layer, Attention):
-            return Fp8KVCacheMethod(self)
+            return quant_source_dicts[quant_source][1](self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
@@ -232,12 +249,19 @@ class Fp8LinearMethod(LinearMethodBase):
               layer: torch.nn.Module,
               x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
+            return apply_quantize(layer, x, self.cutlass_fp8_supported, bias) 
+
+def apply_quantize(layer: torch.nn.Module,
+              x: torch.Tensor,
+              is_cutlass_fp8_supported: bool,
+              bias: Optional[torch.Tensor] = None,
+              ) -> torch.Tensor:
 
         # ops.scaled_fp8_quant supports both dynamic and static quant.
         #   If dynamic, layer.input_scale is None and x_scale computed from x.
         #   If static, layer.input_scale is scalar and x_scale is input_scale.
 
-        if bias is None and self.cutlass_fp8_supported:
+        if bias is None and is_cutlass_fp8_supported :
             qinput, x_scale = ops.scaled_fp8_quant(x, layer.input_scale)
 
             # Fused GEMM_DQ
