@@ -9,7 +9,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearMethodBase
 from vllm.model_executor.layers.quantization.fp8 import (Fp8Config,
                                                          cutlass_fp8_supported,
-                                                         per_tensor_quantize)
+                                                         per_tensor_quantize, 
+                                                         all_close_1d,
+                                                         apply_quantize)
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
@@ -114,25 +116,6 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
                     ModelOptQuantizer(input_amax, **extra_weight_attrs),
                 )
 
-    def scales_shard_indexer(
-        self,
-        param: torch.Tensor,
-        loaded_weight: torch.Tensor,
-        shard_id: Union[str, int],
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        qkv_idxs = {"q": 0, "k": 1, "v": 2}
-
-        if isinstance(shard_id, int):
-            pass
-        elif isinstance(shard_id, str):
-            if shard_id not in qkv_idxs:
-                raise ValueError(f"Unknown shard_id: {shard_id}")
-            shard_id = qkv_idxs[shard_id]
-        else:
-            ValueError(f"Shard id must be int or str but got {type(shard_id)}")
-
-        return param[shard_id], loaded_weight
-
     def process_weights_after_loading(self, layer: Module) -> None:
         if (not hasattr(layer, "process_after_load")
                 or not layer.process_after_load):
@@ -196,51 +179,5 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
-        # ops.scaled_fp8_quant supports both dynamic and static quant.
-        #   If dynamic, layer.input_scale is None and x_scale computed from x.
-        #   If static, layer.input_scale is scalar and x_scale is input_scale.
+      return apply_quantize(layer, x, self.cutlass_fp8_supported, bias) 
 
-        if bias is None and self.cutlass_fp8_supported:
-            qinput, x_scale = ops.scaled_fp8_quant(x, layer.input_scale)
-
-            # Fused GEMM_DQ
-            output = ops.cutlass_scaled_mm(
-                qinput,
-                layer.weight,
-                out_dtype=x.dtype,
-                scale_a=x_scale,
-                scale_b=layer.weight_scale,
-            )
-
-        else:
-            qinput, x_scale = ops.scaled_fp8_quant(x,
-                                                   layer.input_scale,
-                                                   batch_dim_padding=17)
-
-            # Fused GEMM_DQ -- note we padded the input above because
-            # torch._scaled_mm is more performant for matrices with
-            # fake_qweight * batch dimension > 16.
-            # Note that this could change in the future.
-            output, _ = torch._scaled_mm(
-                qinput,
-                layer.weight,
-                out_dtype=x.dtype,
-                scale_a=x_scale,
-                scale_b=layer.weight_scale,
-                bias=bias,
-            )
-
-        return torch.narrow(output, 0, 0, x.shape[0])
-
-
-def all_close_1d(x: torch.Tensor) -> bool:
-    assert len(x.shape) == 1
-    return all(torch.allclose(x[0], x[i]) for i in range(x.shape[0]))
-
-
-def per_tensor_dequantize(
-        tensor: torch.Tensor, inv_scale: Union[float,
-                                               torch.Tensor]) -> torch.Tensor:
-    fake_qweight = tensor.to(torch.float16)
-    dq_weight = fake_qweight * inv_scale
-    return dq_weight
