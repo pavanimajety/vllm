@@ -84,6 +84,7 @@ def run_vllm(
     gpu_memory_utilization: float = 0.9,
     download_dir: Optional[str] = None,
     load_format: str = EngineArgs.load_format,
+    max_num_seqs: Optional[int] = 1024
 ) -> float:
     from vllm import LLM, SamplingParams
     llm = LLM(
@@ -106,6 +107,8 @@ def run_vllm(
         max_num_batched_tokens=max_num_batched_tokens,
         distributed_executor_backend=distributed_executor_backend,
         load_format=load_format,
+        max_num_seqs=max_num_seqs,
+        disable_log_stats=False,
     )
 
     # Add the requests to the engine.
@@ -405,6 +408,10 @@ if __name__ == "__main__":
         'section for more information.\n'
         '* "bitsandbytes" will load the weights using bitsandbytes '
         'quantization.\n')
+    parser.add_argument('--max-num-seqs',
+                        type=int,
+                        help='Extra: The batch size,  basically.')
+
     args = parser.parse_args()
     if args.tokenizer is None:
         args.tokenizer = args.model

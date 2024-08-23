@@ -177,7 +177,7 @@ class FlashInferMetadata(AttentionMetadata):
                 self.page_size,
                 # Disable flashinfer's pos encoding and use vllm's rope.
                 pos_encoding_mode="NONE",
-                data_type=self.data_type)
+                )
 
     def asdict_zerocopy(self,
                         skip_fields: Optional[Set[str]] = None
