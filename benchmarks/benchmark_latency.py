@@ -47,6 +47,9 @@ def main(args: argparse.Namespace):
         distributed_executor_backend=args.distributed_executor_backend,
         otlp_traces_endpoint=args.otlp_traces_endpoint,
         enable_prefix_caching=args.enable_prefix_caching,
+        disable_log_stats=False,
+        max_num_seqs=args.max_num_seqs,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
 
     sampling_params = SamplingParams(
@@ -59,7 +62,7 @@ def main(args: argparse.Namespace):
     )
     print(sampling_params)
     dummy_prompt_token_ids = np.random.randint(10000,
-                                               size=(args.batch_size,
+                                               size=(args.num_prompts,
                                                      args.input_len))
     dummy_inputs: List[PromptInputs] = [{
         "prompt_token_ids": batch
@@ -281,5 +284,19 @@ if __name__ == '__main__':
         type=str,
         default=None,
         help='Target URL to which OpenTelemetry traces will be sent.')
+    parser.add_argument('--max-num-seqs',
+                        type=int,
+                        default=256,
+                        help='Extra: The batch size,  basically.')
+    parser.add_argument('--max-num-batched-tokens',
+                        type=int,
+                        default=16384,
+                        help='maximum number of batched tokens per '
+                        'iteration')       
+    parser.add_argument('--num-prompts',
+                        type=int,
+                        default=1000,
+                        help='maximum number of batched tokens per '
+                        'iteration')       
     args = parser.parse_args()
     main(args)

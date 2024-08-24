@@ -107,7 +107,6 @@ def run_vllm(
         max_num_batched_tokens=max_num_batched_tokens,
         distributed_executor_backend=distributed_executor_backend,
         load_format=load_format,
-        max_num_seqs=max_num_seqs,
         disable_log_stats=False,
     )
 
@@ -235,7 +234,8 @@ def main(args: argparse.Namespace):
             args.quantization_param_path, args.device,
             args.enable_prefix_caching, args.enable_chunked_prefill,
             args.max_num_batched_tokens, args.distributed_executor_backend,
-            args.gpu_memory_utilization, args.download_dir, args.load_format)
+            args.gpu_memory_utilization, args.download_dir, args.load_format,
+            )
     elif args.backend == "hf":
         assert args.tensor_parallel_size == 1
         elapsed_time = run_hf(requests, args.model, tokenizer, args.n,
@@ -410,6 +410,7 @@ if __name__ == "__main__":
         'quantization.\n')
     parser.add_argument('--max-num-seqs',
                         type=int,
+                        default=None,
                         help='Extra: The batch size,  basically.')
 
     args = parser.parse_args()
