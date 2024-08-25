@@ -851,7 +851,7 @@ void cutlass_gemm_sm90_fp8_dispatch(torch::Tensor& out, torch::Tensor const& a,
     }
   } // end of N = 8192, K = 8192
 
-  printf("Not found config for: M=%d, N=%d, K=%d\n", M, N, K);
+  //printf("Not found config for: M=%d, N=%d, K=%d\n", M, N, K);
 
   uint32_t const m = a.size(0);
   uint32_t const mp2 =
