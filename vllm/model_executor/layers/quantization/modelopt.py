@@ -11,8 +11,8 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
 from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
-    apply_fp8_linear, cutlass_fp8_supported, requantize_with_max_scale,
-    create_per_tensor_scale_param)
+    apply_fp8_linear, create_per_tensor_scale_param, cutlass_fp8_supported,
+    requantize_with_max_scale)
 from vllm.model_executor.utils import set_weight_attrs
 
 logger = init_logger(__name__)
@@ -65,7 +65,6 @@ class ModelOptFp8Config(QuantizationConfig):
     def get_quant_method(self, layer: torch.nn.Module,
                          prefix: str) -> Optional["QuantizeMethodBase"]:
         from vllm.attention.layer import Attention  # Avoid circular import
-        from vllm.model_executor.layers.quantization.fp8 import Fp8KVCacheMethod  # Avoid circular import
         if isinstance(layer, LinearBase):
             return ModelOptFp8LinearMethod(self)
         elif isinstance(layer, Attention):
