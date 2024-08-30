@@ -18,15 +18,16 @@ MAX_MODEL_LEN = 1024
 MODELS = ["nvidia/Llama-3.1-8B-Instruct-FP8"]
 
 EXPECTED_STRS_MAP = {
-    "nvidia/Llama-3.1-8B-Instruct-FP8":
-      [ "You're referring to VLLM, a high-performance Large Language Model (LLM) inference and",
-        'Here are the major milestones in the development of artificial intelligence (AI) from 1950 to ', 
-        'The comparison between artificial intelligence (AI) and human intelligence in terms of processing information is a complex and', 
-        'A neural network is a complex system modeled after the human brain, consisting of interconnected nodes or "ne', 
-        '**The Spark of Imagination**\n\nZeta-5, a sleek and efficient robot, whir', 
+    "nvidia/Llama-3.1-8B-Instruct-FP8": [
+        "You're referring to VLLM, a high-performance Large Language Model (LLM) inference and",
+        'Here are the major milestones in the development of artificial intelligence (AI) from 1950 to ',
+        'The comparison between artificial intelligence (AI) and human intelligence in terms of processing information is a complex and',
+        'A neural network is a complex system modeled after the human brain, consisting of interconnected nodes or "ne',
+        '**The Spark of Imagination**\n\nZeta-5, a sleek and efficient robot, whir',
         'The COVID-19 pandemic has had a profound impact on global economic structures and business models, leading to',
         'The Mona Lisa, painted by Leonardo da Vinci in the early 16th century, is one of',
-        'Here are the translations:\n\n**Japanese:** 「早起きは早く獲物をとる']
+        'Here are the translations:\n\n**Japanese:** 「早起きは早く獲物をとる'
+    ]
 }
 
 

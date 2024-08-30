@@ -9,6 +9,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig, QuantizeMethodBase)
+from vllm.model_executor.layers.quantization.kv_cache import BaseKVCacheMethod
 from vllm.model_executor.layers.quantization.utils.w8a8_utils import (
     apply_fp8_linear, cutlass_fp8_supported, requantize_with_max_scale,
     create_per_tensor_scale_param)
@@ -68,11 +69,20 @@ class ModelOptFp8Config(QuantizationConfig):
         if isinstance(layer, LinearBase):
             return ModelOptFp8LinearMethod(self)
         elif isinstance(layer, Attention):
-            return Fp8KVCacheMethod(self)
+            return ModelOptFp8KVCacheMethod(self)
         return None
 
     def get_scaled_act_names(self) -> List[str]:
         return []
+
+
+class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
+    """
+    Supports loading kv-cache scaling factors from FP8 checkpoints.
+    """
+
+    def __init__(self, quant_config: ModelOptFp8Config):
+        super().__init__(quant_config)
 
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
