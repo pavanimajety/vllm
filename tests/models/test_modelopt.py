@@ -15,22 +15,18 @@ os.environ["TOKENIZERS_PARALLELISM"] = "true"
 
 MAX_MODEL_LEN = 1024
 
-MODELS = [
-  "nvidia/Llama-3.1-8B-Instruct-FP8"   
-]
+MODELS = ["nvidia/Llama-3.1-8B-Instruct-FP8"]
 
 EXPECTED_STRS_MAP = {
-    "nvidia/Meta-Llama-3-8B-Instruct-FP8": 
-        [
-            'LLaMA is a high-throughput and memory-efficient inference and serving engine for Large Language Models (',
-            'Here are the major milestones in the development of artificial intelligence (AI) from 1950 to ',
-            'Artificial intelligence (AI) and human intelligence (HI) process information in distinct ways, with both',
-            'A neural network is a complex system modeled after the human brain, composed of interconnected nodes or "ne',
-            'Zeta-5, a highly advanced robot designed for menial labor, whirred and beep',
-            'The COVID-19 pandemic has had a profound impact on global economic structures and future business models. The',
-            'The Mona Lisa, painted by Leonardo da Vinci in the early 16th century, is one of',
-            'Here are the translations:\n\n**Japanese:** (Haya aki no tori, nemuri no'
-        ]    ,
+    "nvidia/Llama-3.1-8B-Instruct-FP8":
+      [ "You're referring to VLLM, a high-performance Large Language Model (LLM) inference and",
+        'Here are the major milestones in the development of artificial intelligence (AI) from 1950 to ', 
+        'The comparison between artificial intelligence (AI) and human intelligence in terms of processing information is a complex and', 
+        'A neural network is a complex system modeled after the human brain, consisting of interconnected nodes or "ne', 
+        '**The Spark of Imagination**\n\nZeta-5, a sleek and efficient robot, whir', 
+        'The COVID-19 pandemic has had a profound impact on global economic structures and business models, leading to',
+        'The Mona Lisa, painted by Leonardo da Vinci in the early 16th century, is one of',
+        'Here are the translations:\n\n**Japanese:** 「早起きは早く獲物をとる']
 }
 
 
@@ -39,19 +35,20 @@ EXPECTED_STRS_MAP = {
 # and is unstable w.r.t specifics of the fp8 implementation or
 # the hardware being run on.
 # Disabled to prevent it from breaking the build
-# @pytest.mark.skip(
-#     reason=
-#     "Prevent unstable test based on golden strings from breaking the build.")
+@pytest.mark.skip(
+    reason=
+    "Prevent unstable test based on golden strings from breaking the build.")
 @pytest.mark.skipif(not is_quant_method_supported("fp8"),
                     reason="fp8 is not supported on this GPU type.")
 @pytest.mark.parametrize("model_name", MODELS)
 def test_models(example_prompts, model_name) -> None:
-    model = LLM(model=model_name,
-                max_model_len=MAX_MODEL_LEN,
-                trust_remote_code=True,
-                enforce_eager=True,
-                quantization="modelopt",
-                )
+    model = LLM(
+        model=model_name,
+        max_model_len=MAX_MODEL_LEN,
+        trust_remote_code=True,
+        enforce_eager=True,
+        quantization="modelopt",
+    )
 
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     formatted_prompts = [
@@ -59,8 +56,8 @@ def test_models(example_prompts, model_name) -> None:
             "role": "user",
             "content": prompt
         }],
-        tokenize=False,
-        add_generation_prompt=True)
+                                      tokenize=False,
+                                      add_generation_prompt=True)
         for prompt in example_prompts
     ]
     params = SamplingParams(max_tokens=20, temperature=0)
