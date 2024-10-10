@@ -71,12 +71,15 @@ def warn_if_different_devices():
     device_ids: int = pynvml.nvmlDeviceGetCount()
     if device_ids > 1:
         device_names = [get_physical_device_name(i) for i in range(device_ids)]
-        if len(set(device_names)) > 1 and os.environ.get(
-                "CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
+        # Convert bytes to str if necessary
+        str_device_names = [name.decode() if isinstance(name, bytes) 
+                                            else name for name in device_names]
+        if len(set(str_device_names)) > 1 and (os.environ.get(
+                                         "CUDA_DEVICE_ORDER") != "PCI_BUS_ID"):
             logger.warning(
                 "Detected different devices in the system: \n%s\nPlease"
-                " make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID` to "
-                "avoid unexpected behavior.", "\n".join(device_names))
+                " make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID` to" 
+                " avoid unexpected behavior.\n".join(str_device_names))
 
 
 try:
