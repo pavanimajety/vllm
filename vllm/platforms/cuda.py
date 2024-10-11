@@ -72,13 +72,17 @@ def warn_if_different_devices():
     if device_ids > 1:
         device_names = [get_physical_device_name(i) for i in range(device_ids)]
         # Convert bytes to str if necessary
-        str_device_names = [name.decode() if isinstance(name, bytes) 
-                                            else name for name in device_names]
-        if len(set(str_device_names)) > 1 and (os.environ.get(
-                                         "CUDA_DEVICE_ORDER") != "PCI_BUS_ID"):
+        str_device_names = []
+        for name in device_names:
+            if not isinstance(name, bytes):
+                str_device_names.append(name)
+            else:
+                str_device_names.append(name.decode())
+        if len(set(str_device_names)) > 1 and (
+                os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID"):
             logger.warning(
                 "Detected different devices in the system: \n%s\nPlease"
-                " make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID` to" 
+                " make sure to set `CUDA_DEVICE_ORDER=PCI_BUS_ID` to"
                 " avoid unexpected behavior.\n".join(str_device_names))
 
 
