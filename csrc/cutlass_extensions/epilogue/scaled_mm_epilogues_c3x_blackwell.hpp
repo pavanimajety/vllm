@@ -12,7 +12,7 @@
    EVTCompute::Arguments struct.
 */
 
-namespace vllm::c3x {
+namespace vllm::c3x_blackwell {
 
 using namespace cute;
 
@@ -298,8 +298,7 @@ struct ScaledEpilogueBiasAzp
         SUPER::template args_from_tensor<AzpWithAdj, int32_t>(azp_adj);
 
     typename EVTComputeAzp::Arguments evt_azp_args{{}, azp_adj_args, {}};
-    typename EVTComputeScaleB::Arguments evt_scale_b_args{
-        b_args, evt_azp_args, {}};
+    typename EVTComputeScaleB::Arguments evt_scale_b_args{b_args, evt_azp_args, {}};
     return ArgumentType{a_args, evt_scale_b_args, bias_args, {}};
   }
 };
@@ -377,8 +376,7 @@ struct ScaledEpilogueBiasAzpToken
 
     typename EVTComputeAzp::Arguments evt_azp_args{azp_args, azp_adj_args, {}};
     typename EVTComputeAcc::Arguments evt_acc_args{{}, evt_azp_args, {}};
-    typename EVTComputeScaleB::Arguments evt_scale_b_args{
-        b_args, evt_acc_args, {}};
+    typename EVTComputeScaleB::Arguments evt_scale_b_args{b_args, evt_acc_args, {}};
     return ArgumentType{a_args, evt_scale_b_args, bias_args, {}};
   }
 };
