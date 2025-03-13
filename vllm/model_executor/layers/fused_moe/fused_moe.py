@@ -1586,6 +1586,8 @@ def cutlass_moe(
     c_strides2: torch.Tensor,
     intermediate_scale: Optional[torch.Tensor] = None,
 ):
+    import pdb; pdb.set_trace()
+
     topk = topk_ids.shape[1]
     per_act_token = a_scale.numel() != 1
     device = a_q.device
@@ -1606,10 +1608,12 @@ def cutlass_moe(
     torch.ops._C.get_grouped_mm_data(topk_ids, expert_offsets, problem_sizes1,
                                      problem_sizes2, a_map, c_map, num_groups,
                                      n, k)
-
+    breakpoint()
     rep_a_q = a_q.view(dtype=torch.uint8)[a_map].view(dtype=a_q.dtype)
     rep_a_scales = a_scale[a_map] if per_act_token else a_scale
-
+   
+    print(f"{rep_a_q.shape=}")
+    print(f"{rep_a_q=}")
     c1 = torch.empty((m * topk, n * 2), device=device, dtype=torch.half)
     c2 = torch.empty((m * topk, k), device=device, dtype=torch.half)
 
@@ -1629,6 +1633,52 @@ def cutlass_moe(
                                     intermediate_scales, w2_scale,
                                     expert_offsets[:-1], problem_sizes2,
                                     ab_strides2, ab_strides2, c_strides2)
+    return c2.half().sum(dim=1) 
+    #return (c2[c_map].view(m, topk, k) *
+            #topk_weights.view(m, topk, 1).half()).sum(dim=1)
 
-    return (c2[c_map].view(m, topk, k) *
-            topk_weights.view(m, topk, 1).half()).sum(dim=1)
+
+def cutlass_fp4_quant_and_moe(
+   hidden_states: torch.Tensor, #High Precision
+   input_scale_13: torch.Tensor, #FP32
+   input_scale_2: torch.Tensor, #FP32
+   w13_fp4: torch.Tensor, #FP4
+   w2_fp4: torch.Tensor, #FP4
+   w13_blockscale: torch.Tensor, #FP8
+   w2_blockscale: torch.Tensor, #FP8
+   w13_globalscale: torch.Tensor, #FP32
+   w2_globalscale: torch.Tensor, #FP32
+   topk_weights: torch.Tensor, #High Precision
+   topk_ids: torch.Tensor, #Int
+   m: int,
+   n: int,
+   k: int,
+   num_experts: int,
+   ab_strides1: torch.Tensor,
+   ab_bs_strides1: torch.Tensor,
+   c_strides: torch.Tensor,
+   ab_strides2: torch.Tensor,
+   ab_bs_strides2: torch.Tensor,
+   c_strides2: torch.Tensor,
+):
+    """
+    topk_ids shape:[M, num_topk]
+    
+    we compute the 
+    
+    
+    """
+    num_topk = topk_ids.shape[1]
+    device = hidden_states.device
+    # Problem size:  (num_experts, (m,n,k))
+    problem_sizes_gemm1 = torch.empty((num_experts, 3),
+                                      dtype=torch.int32,
+                                      device=device)
+    problem_sizes_gemm2 = torch.empty((num_experts, 3), # (num_experts, (m,n,k))
+                                      dtype=torch.int32,
+                                      device=device)
+    
+    
+    return
+    
+    

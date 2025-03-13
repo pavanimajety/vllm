@@ -207,6 +207,9 @@ __global__ void compute_problem_sizes(const int* __restrict__ topk_ids,
     problem_sizes2[expert_id * 3] = final_occurrences;
     problem_sizes2[expert_id * 3 + 1] = k;
     problem_sizes2[expert_id * 3 + 2] = n;
+    if(blockIdx.x == 0){
+      printf("Finished computing problem sizes:");
+    }
   }
 }
 
@@ -219,6 +222,9 @@ __global__ void compute_expert_offsets(
     atomic_buffer[i] = tot_offset;
     tot_offset += problem_sizes1[i * 3];
     expert_offsets[i + 1] = tot_offset;
+  }
+  if(threadIdx.x == 0 && blockIdx.x == 0){
+    printf("Finished computing expert offsets");
   }
 }
 
@@ -235,6 +241,11 @@ __global__ void compute_arg_sorts(const int* __restrict__ topk_ids,
       arg_sort_prim[i] = start;
     }
   }
+  
+  if(threadIdx.x == 0 && blockIdx.x == 0){
+    printf("Finished computing arg sorts sizes:");
+  }
+
 }
 
 constexpr int THREADS_PER_EXPERT_2 = 32;
@@ -289,12 +300,14 @@ void get_grouped_mm_data_caller(
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     torch::Tensor& arg_sort, torch::Tensor& arg_sort_prim,
     const int64_t num_experts, const int64_t n, const int64_t k) {
+  std::cout << "Print from get_grouped_mm_data_caller"<<std::endl;
   auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
   auto options_int32 =
       torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
   torch::Tensor atomic_buffer = torch::zeros(num_experts, options_int32);
 
   // TODO this is an alternative way to block kernels
+
   constexpr bool multi_expert_blocks = false;
   if constexpr (multi_expert_blocks) {
     int num_blocks = (num_experts + 3) / 4;
@@ -316,6 +329,8 @@ void get_grouped_mm_data_caller(
   }
 
   int num_threads = min(THREADS_PER_EXPERT, topk_ids.numel());
+  std::cout << "Computing problem sizes with num_threads: "<< num_threads
+              << "num_experts: " << num_experts << std::endl; 
   compute_problem_sizes<<<num_experts, num_threads, 0, stream>>>(
       (const int32_t*)topk_ids.data_ptr(), (int32_t*)problem_sizes1.data_ptr(),
       (int32_t*)problem_sizes2.data_ptr(), (int32_t*)atomic_buffer.data_ptr(),
