@@ -39,12 +39,6 @@ void cutlass_grouped_mm_sm90(
 
 #endif
 
-void get_grouped_mm_data_caller(
-    const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
-    torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
-    torch::Tensor& arg_sort, torch::Tensor& arg_sort_prim,
-    const int64_t num_experts, const int64_t n, const int64_t k);
-
 
 #if defined ENABLE_SCALED_MM_SM100 && ENABLE_SCALED_MM_SM100
 void cutlass_scaled_mm_sm100(torch::Tensor& c, torch::Tensor const& a,
@@ -203,17 +197,6 @@ void cutlass_grouped_mm(
       version_num);
 }
 
-void get_grouped_mm_data(const torch::Tensor& topk_ids,
-                         torch::Tensor& expert_offsets,
-                         torch::Tensor& problem_sizes1,
-                         torch::Tensor& problem_sizes2, torch::Tensor& arg_sort,
-                         torch::Tensor& arg_sort_prim,
-                         const int64_t num_experts, const int64_t n,
-                         const int64_t k) {
-  get_grouped_mm_data_caller(topk_ids, expert_offsets, problem_sizes1,
-                             problem_sizes2, arg_sort, arg_sort_prim,
-                             num_experts, n, k);
-}
 
 void cutlass_scaled_mm_azp(torch::Tensor& c, torch::Tensor const& a,
                            torch::Tensor const& b,
