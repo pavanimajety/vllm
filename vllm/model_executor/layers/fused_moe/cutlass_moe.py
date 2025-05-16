@@ -279,9 +279,16 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
                     w1_fp4: torch.Tensor, w1_blockscale: torch.Tensor,
                     w1_alphas: torch.Tensor, a2_gscale: torch.Tensor,
                     w2_fp4: torch.Tensor, w2_blockscale: torch.Tensor,
-                    w2_alphas: torch.Tensor, topk_weights: torch.Tensor,
+                    w2_alphas: torch.Tensor,
+                    ab_strides_13: torch.Tensor,
+                    ab_strides_2: torch.Tensor,
+                    c_strides_13: torch.Tensor,
+                    c_strides_2: torch.Tensor,
+                    topk_weights: torch.Tensor,
                     topk_ids: torch.Tensor, m: int, n: int, k: int, e: int,
-                    device: torch.device):
+                    device: torch.device,
+                    expert_map: Optional[torch.Tensor] = None,
+                    apply_router_weight_on_input: bool = False):
     """
     MoE implementation for FP4 Inputs
     
@@ -306,9 +313,24 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
     
     m, n, k: Unquantized weight shapes, dtype: int
     e: number of experts, dtype: int
+    
+    # strides for activation and weight tensors to go from one row to the next
+    # per local_num_experts
+    ab_strides_13: [e]
+    ab_strides_2: [e]
+    c_strides_13: [e]
+    c_strides_2: [e]
 
     assumes that topk < k < n to satisfy - up/down projection expectations.
+    - expert_map (Optional[torch.Tensor]): In the case of Expert parallel,
+       every Rank is responsible for a subset of experts. expert_map is a
+       mapping from global expert-id to local expert-id. When expert_map[i]
+       is -1, it means that this Rank is not responsible for global
+       expert-id i.
+    - apply_router_weight_on_input (bool): When true, the topk weights are
+       applied directly on the inputs. This is only applicable when topk is 1.
     """
+    
     assert topk_weights.shape == topk_ids.shape, "topk shape mismatch"
     assert w1_fp4.dtype == torch.uint8, "weight 1 must be uint8"
     assert w2_fp4.dtype == torch.uint8, "weight 2 must be uint8"
@@ -335,22 +357,38 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
         f" for cutlass_moe_fp4, observed m = {m}. Use"
         f" VLLM_MODELOPT_MAX_TOKENS_PER_EXPERT to set this value.")
     out_dtype = a.dtype
-    num_topk = topk_ids.shape[1]
-
+    local_topk_ids = topk_ids
+    if expert_map is not None:
+        # Translate info from expert_map to topk_ids
+        local_topk_ids = torch.where(expert_map[topk_ids] != -1,
+                                     expert_map[topk_ids], -1)
+    num_topk = local_topk_ids.size(1)
     expert_offsets = torch.empty((e + 1), dtype=torch.int32, device=device)
     # Problem size:  (num_experts, (m,2n,k))
     problem_sizes1 = torch.empty((e, 3), dtype=torch.int32, device=device)
     # Problem size:  (num_experts, (m,n,k))
     problem_sizes2 = torch.empty((e, 3), dtype=torch.int32, device=device)
 
-    a_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
-    c_map = torch.empty((topk_ids.numel()), dtype=torch.int32, device=device)
+    a_map_initializer = torch.empty
+    c2_zero_initializer = False
+    if expert_map is not None:
+        # With expert_map each Rank processes only a subset of experts. As
+        # a result not all of a_map and c2 tensors are filled. We fill it
+        # zeros for correctness.
+        a_map_initializer = torch.zeros
+        c2_zero_initializer = True
+
+    a_map = a_map_initializer((local_topk_ids.numel()),
+                              dtype=torch.int32,
+                              device=device)
+    c_map = torch.empty((local_topk_ids.numel()),
+                        dtype=torch.int32,
+                        device=device)
 
     # problem shapes should have [m, n, k]
     # Note that problem sizes are based on logical number of elements.
-    ops.get_cutlass_moe_mm_data(topk_ids, expert_offsets, problem_sizes1,
+    ops.get_cutlass_moe_mm_data(local_topk_ids, expert_offsets, problem_sizes1,
                                 problem_sizes2, a_map, c_map, e, n, k)
-
     tokens_per_expert = problem_sizes1[:, 0]
     rounded_tokens_per_expert = (tokens_per_expert + (128 - 1)) // 128 * 128
     blockscale_offsets = torch.zeros(e + 1, dtype=torch.int32, device=device)
@@ -363,12 +401,13 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
         blockscale_offsets,
         num_topk,
         expert_map=a_map,
-        MAX_TOKENS_PER_EXPERT=MAX_TOKENS_PER_EXPERT)
+        )
 
     c1 = ops.cutlass_fp4_moe_mm(rep_a_fp4, w1_fp4, rep_a_blockscale,
-                                w1_blockscale, w1_alphas, problem_sizes1,
-                                expert_offsets[:-1], blockscale_offsets[:-1],
-                                out_dtype, device)
+                                w1_blockscale, w1_alphas,
+                                ab_strides_13, c_strides_13,
+                                problem_sizes1, expert_offsets[:-1],
+                                blockscale_offsets[:-1], out_dtype, device)
     del rep_a_fp4, rep_a_blockscale
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty((m * num_topk, w1_fp4.shape[1] // 2),
@@ -383,12 +422,15 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
         expert_offsets,
         blockscale_offsets,
         num_topk,
-        MAX_TOKENS_PER_EXPERT=MAX_TOKENS_PER_EXPERT)
+        )
 
     c2 = ops.cutlass_fp4_moe_mm(int_fp4, w2_fp4, int_blockscale, w2_blockscale,
-                                w2_alphas, problem_sizes2, expert_offsets[:-1],
-                                blockscale_offsets[:-1], out_dtype, device)
+                                w2_alphas, ab_strides_2, c_strides_2,
+                                problem_sizes2, expert_offsets[:-1],
+                                blockscale_offsets[:-1], out_dtype, device,
+                                zero_initializer=c2_zero_initializer)
     del int_fp4, int_blockscale
-    out = (c2[c_map].view(m, num_topk, k) *
-           topk_weights.view(m, num_topk, 1).half()).sum(dim=1)
-    return out.to(dtype=out_dtype)
+    c2 = c2[c_map].view(m, num_topk, k)
+    if not apply_router_weight_on_input:
+        c2 = c2 * topk_weights.view(m, num_topk, 1).to(out_dtype)
+    return c2.sum(dim=1).to(out_dtype)
