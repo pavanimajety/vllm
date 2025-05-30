@@ -5,6 +5,12 @@
 
 #include <iostream>
 
+#include <cutlass/array.h>
+#include <cutlass/numeric_types.h>
+
+#include "../../../moe/permute_unpermute_kernels/dispatch.h"
+
+
 constexpr uint64_t THREADS_PER_EXPERT = 512;
 
 __global__ void compute_problem_sizes(const int* __restrict__ topk_ids,
@@ -45,6 +51,22 @@ __global__ void compute_expert_offsets(
   }
 }
 
+__global__ void compute_expert_blockscale_offsets(
+    const int32_t* __restrict__ problem_sizes1, int32_t* expert_offsets, int32_t* blockscale_offsets, 
+    int32_t* atomic_buffer, const int num_experts) {
+  int32_t tot_offset = 0;
+  int32_t tot_offset_round = 0;
+  expert_offsets[0] = 0;
+  blockscale_offsets[0] = 0;
+  for (int i = 0; i < num_experts; ++i) {
+    atomic_buffer[i] = tot_offset;
+    tot_offset += problem_sizes1[i * 3];
+    expert_offsets[i + 1] = tot_offset;
+    tot_offset_round += (problem_sizes1[i * 3] + (128 - 1)) / 128 * 128;
+    blockscale_offsets[i + 1] = tot_offset_round;
+  }
+}
+
 __global__ void compute_arg_sorts(const int* __restrict__ topk_ids,
                                   const int32_t* __restrict__ expert_offsets,
                                   int32_t* input_permutation,
@@ -77,7 +99,7 @@ void get_cutlass_moe_mm_data_caller(
     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
-    const int64_t num_experts, const int64_t n, const int64_t k) {
+    const int64_t num_experts, const int64_t n, const int64_t k, const std::optional<torch::Tensor>& blockscale_offsets) {
   auto stream = at::cuda::getCurrentCUDAStream(topk_ids.device().index());
   auto options_int32 =
       torch::TensorOptions().dtype(torch::kInt32).device(topk_ids.device());
@@ -89,10 +111,19 @@ void get_cutlass_moe_mm_data_caller(
       static_cast<int32_t*>(problem_sizes1.data_ptr()),
       static_cast<int32_t*>(problem_sizes2.data_ptr()),
       static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(), n, k);
+  if (blockscale_offsets.has_value()) {
+    compute_expert_blockscale_offsets<<<1, 1, 0, stream>>>(
+        static_cast<const int32_t*>(problem_sizes1.data_ptr()),
+        static_cast<int32_t*>(expert_offsets.data_ptr()),
+        static_cast<int32_t*>(blockscale_offsets.value().data_ptr()),
+        static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts);
+  }
+  else {
   compute_expert_offsets<<<1, 1, 0, stream>>>(
       static_cast<const int32_t*>(problem_sizes1.data_ptr()),
       static_cast<int32_t*>(expert_offsets.data_ptr()),
       static_cast<int32_t*>(atomic_buffer.data_ptr()), num_experts);
+  }
   compute_arg_sorts<<<num_experts, num_threads, 0, stream>>>(
       static_cast<const int32_t*>(topk_ids.data_ptr()),
       static_cast<const int32_t*>(expert_offsets.data_ptr()),
@@ -100,4 +131,59 @@ void get_cutlass_moe_mm_data_caller(
       static_cast<int32_t*>(output_permutation.data_ptr()),
       static_cast<int32_t*>(atomic_buffer.data_ptr()), topk_ids.numel(),
       topk_ids.size(1));
+}
+
+
+template <typename T>
+__global__ void expandInputRowsKernel(
+    const T* input, const int32_t* dst2src_map, T* output,
+    int64_t num_src_rows, int64_t num_dst_rows, int64_t num_cols) {
+  int64_t dest_row_idx = blockIdx.x;
+  int64_t const source_row_idx = dst2src_map[dest_row_idx];
+
+  if (blockIdx.x < num_dst_rows) {
+    // Load 128-bits per thread
+    constexpr int64_t ELEM_PER_THREAD = 128 / sizeof(T) / 8;
+    using DataElem = cutlass::Array<T, ELEM_PER_THREAD>;
+
+    // Duplicate and permute rows
+    auto const* source_row_ptr =
+        reinterpret_cast<DataElem const*>(input + source_row_idx * num_cols);
+    auto* dest_row_ptr =
+        reinterpret_cast<DataElem*>(output + dest_row_idx * num_cols);
+
+    int64_t const start_offset = threadIdx.x;
+    int64_t const stride = blockDim.x;
+    int64_t const num_elems_in_col = num_cols / ELEM_PER_THREAD;
+
+    for (int elem_index = start_offset; elem_index < num_elems_in_col;
+         elem_index += stride) {
+      dest_row_ptr[elem_index] = source_row_ptr[elem_index];
+    }
+  }
+}
+
+void moe_permute_caller(
+    const torch::Tensor& input_tensor,
+    const torch::Tensor& dst2src_map,
+    torch::Tensor& output_tensor) {
+  TORCH_CHECK(input_tensor.scalar_type() == output_tensor.scalar_type(),
+              "Input and output tensors must have the same data type");
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int64_t const blocks = output_tensor.size(0);
+  int64_t const threads = 256;
+  int64_t const num_dest_rows = output_tensor.size(0);
+  int64_t const num_src_rows = input_tensor.size(0);
+  int64_t const num_cols = input_tensor.size(1);
+
+  MOE_DISPATCH(input_tensor.scalar_type(), [&] {
+        expandInputRowsKernel<scalar_t><<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<scalar_t*>(input_tensor.data_ptr()),
+            dst2src_map.data_ptr<int32_t>(),
+            reinterpret_cast<scalar_t*>(output_tensor.data_ptr()),
+            num_src_rows,
+            num_dest_rows,
+            num_cols);
+      });
 }
