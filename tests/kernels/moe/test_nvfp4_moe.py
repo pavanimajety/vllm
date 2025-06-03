@@ -127,39 +127,62 @@ def test_cutlass_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
     with set_current_vllm_config(
             VllmConfig(parallel_config=ParallelConfig(
                 pipeline_parallel_size=1))):
-
-        a = torch.randn((m, k), device="cuda", dtype=dtype) / 10
-        w1 = torch.randn((e, 2 * n, k), device="cuda", dtype=dtype) / 10
-        w2 = torch.randn((e, k, n), device="cuda", dtype=dtype) / 10
+        device = "cuda"
+        a = torch.randn((m, k), device=device, dtype=dtype) / 10
+        w1 = torch.randn((e, 2 * n, k), device=device, dtype=dtype) / 10
+        w2 = torch.randn((e, k, n), device=device, dtype=dtype) / 10
         quant_blocksize = 16
         
         w1_q, w2_q, w1_blockscale, w2_blockscale, w1_gs, w2_gs = (
             convert_inputs_to_fp4(w1, w2, e, n, k, quant_blocksize, dtype))
 
-        score = torch.randn((m, e), device="cuda", dtype=dtype)
-        a1_gs = torch.ones((e, ), device="cuda", dtype=torch.float32)
-        a2_gs = torch.ones((e, ), device="cuda", dtype=torch.float32)
+        score = torch.randn((m, e), device=device, dtype=dtype)
+        a1_gs = torch.ones((e, ), device=device, dtype=torch.float32)
+        a2_gs = torch.ones((e, ), device=device, dtype=torch.float32)
         assert e > topk, "Number of experts must be greater than topk"
         topk_weights, topk_ids, _ = fused_topk(a, score, topk,
                                                renormalize=False)
         # strides for the cutlass moe_fp4 kernel
         ab_strides_13 = torch.full((e,),
                                   w1_q.shape[2] * 2,
-                                  dtype=torch.int32, 
-                                  device=w1_q.device)
+                                  dtype=torch.int64, 
+                                  device=device)
         c_strides_13 = torch.full((e,),
                                  w1_q.shape[1],
-                                 dtype=torch.int32,
-                                 device=w1_q.device)
+                                 dtype=torch.int64,
+                                 device=device)
         ab_strides_2 = torch.full((e,),
                                  w2_q.shape[2] * 2,
-                                 dtype=torch.int32,
-                                 device=w2_q.device)
+                                 dtype=torch.int64,
+                                 device=device)
         c_strides_2 = torch.full((e,),
                                  w2_q.shape[1],
-                                 dtype=torch.int32,
-                                 device=w2_q.device)
-        
+                                 dtype=torch.int64,
+                                 device=device)
+        a_ptrs = torch.empty((e,),
+                            dtype=torch.int64,
+                            device=device)
+        b_ptrs = torch.empty((e,),
+                            dtype=torch.int64,  
+                            device=device)
+        out_ptrs = torch.empty((e,),
+                              dtype=torch.int64,
+                              device=device)
+        a_scales_ptrs = torch.empty((e,),
+                                   dtype=torch.int64,
+                                   device=device)
+        b_scales_ptrs = torch.empty((e,),
+                                   dtype=torch.int64,
+                                   device=device)
+        alpha_ptrs = torch.empty((e,),
+                                dtype=torch.int64,
+                                device=device)
+        layout_sfa = torch.empty((e,5),
+                                dtype=torch.int64,
+                                device=device)
+        layout_sfb = torch.empty((e,5),
+                                dtype=torch.int64,
+                                device=device)
         cutlass_output = cutlass_moe_fp4(
             a=a,
             a1_gscale=a1_gs,
@@ -174,6 +197,14 @@ def test_cutlass_fp4_moe_no_graph(m: int, n: int, k: int, e: int, topk: int,
             ab_strides_2=ab_strides_2,
             c_strides_13=c_strides_13,
             c_strides_2=c_strides_2,
+            a_ptrs=a_ptrs,
+            b_ptrs=b_ptrs,
+            out_ptrs=out_ptrs,
+            a_scales_ptrs=a_scales_ptrs,
+            b_scales_ptrs=b_scales_ptrs,
+            alpha_ptrs=alpha_ptrs,
+            layout_sfa=layout_sfa,
+            layout_sfb=layout_sfb,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             m=m,

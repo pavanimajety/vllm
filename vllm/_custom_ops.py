@@ -885,6 +885,10 @@ def cutlass_fp4_moe_mm(a_tensors: torch.Tensor, b_tensors: torch.Tensor,
                        c_strides: torch.Tensor,
                        problem_sizes: torch.Tensor,
                        expert_offsets: torch.Tensor, sf_offsets: torch.Tensor,
+                       a_ptrs: torch.Tensor, b_ptrs: torch.Tensor,
+                       out_ptrs: torch.Tensor, a_scales_ptrs: torch.Tensor,
+                       b_scales_ptrs: torch.Tensor, alpha_ptrs: torch.Tensor,
+                       layout_sfa: torch.Tensor, layout_sfb: torch.Tensor,
                        out_dtype: torch.dtype, device: torch.device,
                        zero_initializer: bool = False):
     """
@@ -911,7 +915,11 @@ def cutlass_fp4_moe_mm(a_tensors: torch.Tensor, b_tensors: torch.Tensor,
     torch.ops._C.cutlass_fp4_group_mm(c, a_tensors, b_tensors, a_scales,
                                       b_scales, alphas, ab_strides_13,
                                       c_strides, problem_sizes,
-                                      expert_offsets, sf_offsets)
+                                      expert_offsets, sf_offsets,
+                                      # meta-data
+                                      a_ptrs, b_ptrs, out_ptrs, 
+                                      a_scales_ptrs, b_scales_ptrs, alpha_ptrs,
+                                      layout_sfa, layout_sfb)
     return c.to(out_dtype)
 
 
@@ -1133,10 +1141,12 @@ def scaled_fp4_experts_quant(
 
     if expert_map is not None:        
         num_tokens_expanded = expert_map.shape[0]
-        input_tensor = torch.empty((num_tokens_expanded, input_tensor.shape[1]),
+        input_tensor_permuted = torch.empty((num_tokens_expanded, input_tensor.shape[1]),
                                       device=input_tensor.device,
                                       dtype=input_tensor.dtype)
         moe_permute(input_tensor, expert_map, input_tensor_permuted)
+    else:
+        input_tensor_permuted = input_tensor
     m_numtopk, k = input_tensor_permuted.shape
     assert (m_numtopk <= MAX_TOKENS_PER_EXPERT * topk), (
         f"m_numtopk must be less than MAX_TOKENS_PER_EXPERT * topk for"
@@ -1153,7 +1163,7 @@ def scaled_fp4_experts_quant(
                                 padded_k,
                                 dtype=torch.int32,
                                 device=input_tensor.device)
-    torch.ops._C.scaled_fp4_experts_quant(output, output_scales, input_tensor,
+    torch.ops._C.scaled_fp4_experts_quant(output, output_scales, input_tensor_permuted,
                                           input_global_scale,
                                           expert_offsets,
                                           blockscale_offsets)

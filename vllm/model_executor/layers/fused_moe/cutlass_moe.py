@@ -284,6 +284,10 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
                     ab_strides_2: torch.Tensor,
                     c_strides_13: torch.Tensor,
                     c_strides_2: torch.Tensor,
+                    a_ptrs: torch.Tensor, b_ptrs: torch.Tensor,
+                    out_ptrs: torch.Tensor, a_scales_ptrs: torch.Tensor,
+                    b_scales_ptrs: torch.Tensor, alpha_ptrs: torch.Tensor,
+                    layout_sfa: torch.Tensor, layout_sfb: torch.Tensor,
                     topk_weights: torch.Tensor,
                     topk_ids: torch.Tensor, m: int, n: int, k: int, e: int,
                     device: torch.device,
@@ -404,7 +408,10 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
                                 w1_blockscale, w1_alphas,
                                 ab_strides_13, c_strides_13,
                                 problem_sizes1, expert_offsets[:-1],
-                                blockscale_offsets[:-1], out_dtype, device)
+                                blockscale_offsets[:-1], a_ptrs, b_ptrs, out_ptrs,
+                                a_scales_ptrs, b_scales_ptrs, alpha_ptrs,
+                                layout_sfa, layout_sfb,
+                                out_dtype, device)
     del rep_a_fp4, rep_a_blockscale
     # hidden size dimension is split to one halfpytho sized tensor.
     intermediate = torch.empty((m * num_topk, w1_fp4.shape[1] // 2),
@@ -424,7 +431,10 @@ def cutlass_moe_fp4(a: torch.Tensor, a1_gscale: torch.Tensor,
     c2 = ops.cutlass_fp4_moe_mm(int_fp4, w2_fp4, int_blockscale, w2_blockscale,
                                 w2_alphas, ab_strides_2, c_strides_2,
                                 problem_sizes2, expert_offsets[:-1],
-                                blockscale_offsets[:-1], out_dtype, device,
+                                blockscale_offsets[:-1], a_ptrs, b_ptrs, out_ptrs,
+                                a_scales_ptrs, b_scales_ptrs, alpha_ptrs,
+                                layout_sfa, layout_sfb,
+                                out_dtype, device,
                                 zero_initializer=c2_zero_initializer)
     del int_fp4, int_blockscale
     c2 = c2[c_map].view(m, num_topk, k)

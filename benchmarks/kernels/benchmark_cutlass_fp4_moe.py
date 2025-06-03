@@ -106,7 +106,6 @@ def bench_run(
     # k_b_scales = k if per_out_ch else 1
     w1_fp4 = torch.empty((num_experts, 2 * n, k // 2), device=device, dtype=torch.uint8)
     w2_fp4 = torch.empty((num_experts, k, n // 2), device=device, dtype=torch.uint8)
-
     w1_gs = torch.empty((num_experts,), device=device, dtype=torch.float32)
     w2_gs = torch.empty((num_experts,), device=device, dtype=torch.float32)
     a1_gs = torch.ones((num_experts,), device=device, dtype=torch.float32)
@@ -127,7 +126,48 @@ def bench_run(
         w2_fp4[expert], w2_blockscale[expert] = ops.scaled_fp4_quant(
             w2_e, w2_gs[expert]
         )
-
+    ab_strides1 = torch.full((num_experts,),
+                               w1_fp4.shape[2] * 2,
+                               dtype=torch.int64, 
+                               device=device)
+    c_strides1 = torch.full((num_experts,),
+                             w1_fp4.shape[1],
+                             dtype=torch.int64,
+                             device=device)
+    ab_strides2 = torch.full((num_experts,),
+                             w2_fp4.shape[2] * 2,
+                             dtype=torch.int64,
+                             device=device)
+    c_strides2 = torch.full((num_experts,),
+                             w2_fp4.shape[1],
+                             dtype=torch.int64,
+                             device=device)
+    e = num_experts
+    a_ptrs = torch.empty((e,),
+                            dtype=torch.int64,
+                            device=device)
+    b_ptrs = torch.empty((e,),
+                            dtype=torch.int64,  
+                            device=device)
+    out_ptrs = torch.empty((e,),
+                              dtype=torch.int64,
+                              device=device)
+    a_scales_ptrs = torch.empty((e,),
+                               dtype=torch.int64,
+                               device=device)
+    b_scales_ptrs = torch.empty((e,),
+                               dtype=torch.int64,
+                               device=device)
+    alpha_ptrs = torch.empty((e,),
+                            dtype=torch.int64,
+                            device=device)
+    layout_sfa = torch.empty((e,5),
+                            dtype=torch.int64,
+                            device=device)
+    layout_sfb = torch.empty((e,5),
+                            dtype=torch.int64,
+                            device=device)
+    
     def run_triton_moe(
         a: torch.Tensor,
         w1: torch.Tensor,
@@ -160,6 +200,18 @@ def bench_run(
         w2_blockscale: torch.Tensor,
         w1_gs: torch.Tensor,
         w2_gs: torch.Tensor,
+        ab_strides1: torch.Tensor,
+        ab_strides2: torch.Tensor,
+        c_strides1: torch.Tensor,
+        c_strides2: torch.Tensor,
+        a_ptrs: torch.Tensor,
+        b_ptrs: torch.Tensor,
+        out_ptrs: torch.Tensor,
+        a_scales_ptrs: torch.Tensor,
+        b_scales_ptrs: torch.Tensor,
+        alpha_ptrs: torch.Tensor,
+        layout_sfa: torch.Tensor,
+        layout_sfb: torch.Tensor,
         a1_gs: torch.Tensor,
         a2_gs: torch.Tensor,
         topk_weights: torch.Tensor,
@@ -183,12 +235,24 @@ def bench_run(
                     w2_fp4=w2_fp4,
                     w2_blockscale=w2_blockscale,
                     w2_alphas=w2_gs,
+                    ab_strides_13=ab_strides1,
+                    ab_strides_2=ab_strides2,
+                    c_strides_13=c_strides1,
+                    c_strides_2=c_strides2,
+                    a_ptrs=a_ptrs,
+                    b_ptrs=b_ptrs,
+                    out_ptrs=out_ptrs,
+                    a_scales_ptrs=a_scales_ptrs,
+                    b_scales_ptrs=b_scales_ptrs,
+                    layout_sfa=layout_sfa,
+                    layout_sfb=layout_sfb,
+                    alpha_ptrs=alpha_ptrs,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                     m=m,
                     n=n,
                     k=k,
-                    e=num_experts,
+                    e=e,
                     device=device,
                 )
 
@@ -202,6 +266,18 @@ def bench_run(
         w2_fp4: torch.Tensor,
         w2_blockscale: torch.Tensor,
         w2_alphas: torch.Tensor,
+        ab_strides_13: torch.Tensor,
+        ab_strides_2: torch.Tensor,
+        c_strides_13: torch.Tensor,
+        c_strides_2: torch.Tensor,
+        a_ptrs: torch.Tensor,
+        b_ptrs: torch.Tensor,
+        out_ptrs: torch.Tensor,
+        a_scales_ptrs: torch.Tensor,
+        b_scales_ptrs: torch.Tensor,
+        alpha_ptrs: torch.Tensor,
+        layout_sfa: torch.Tensor,
+        layout_sfb: torch.Tensor,
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
         m: int,
@@ -215,20 +291,32 @@ def bench_run(
         ):
             return cutlass_moe_fp4(
                 a=a,
-                a1_gscale=a1_gs,
+                a1_gscale=a1_gscale,
                 w1_fp4=w1_fp4,
                 w1_blockscale=w1_blockscale,
                 w1_alphas=w1_alphas,
-                a2_gscale=a2_gs,
+                a2_gscale=a2_gscale,
                 w2_fp4=w2_fp4,
                 w2_blockscale=w2_blockscale,
                 w2_alphas=w2_alphas,
+                ab_strides_13=ab_strides_13,
+                ab_strides_2=ab_strides_2,
+                c_strides_13=c_strides_13,
+                c_strides_2=c_strides_2,
+                a_ptrs=a_ptrs,
+                b_ptrs=b_ptrs,
+                out_ptrs=out_ptrs,
+                a_scales_ptrs=a_scales_ptrs,
+                b_scales_ptrs=b_scales_ptrs,
+                alpha_ptrs=alpha_ptrs,
+                layout_sfa=layout_sfa,
+                layout_sfb=layout_sfb,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
                 m=m,
                 n=n,
                 k=k,
-                e=num_experts,
+                e=e,
                 device=device,
             )
 
@@ -275,6 +363,18 @@ def bench_run(
             w2_fp4=w2_fp4,
             w2_blockscale=w2_blockscale,
             w2_alphas=w2_gs,
+            ab_strides_13=ab_strides1,
+            ab_strides_2=ab_strides2,
+            c_strides_13=c_strides1,
+            c_strides_2=c_strides2,
+            a_ptrs=a_ptrs,
+            b_ptrs=b_ptrs,
+            out_ptrs=out_ptrs,
+            a_scales_ptrs=a_scales_ptrs,
+            b_scales_ptrs=b_scales_ptrs,
+            alpha_ptrs=alpha_ptrs,
+            layout_sfa=layout_sfa,
+            layout_sfb=layout_sfb,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
             m=m,
@@ -325,6 +425,18 @@ def bench_run(
         "w2_fp4": w2_fp4,
         "w2_blockscale": w2_blockscale,
         "w2_alphas": w2_gs,
+        "ab_strides1": ab_strides1,
+        "ab_strides2": ab_strides2,
+        "c_strides1": c_strides1,
+        "c_strides2": c_strides2,
+        "a_ptrs": a_ptrs,
+        "b_ptrs": b_ptrs,
+        "out_ptrs": out_ptrs,
+        "a_scales_ptrs": a_scales_ptrs,
+        "b_scales_ptrs": b_scales_ptrs,
+        "alpha_ptrs": alpha_ptrs,
+        "layout_sfa": layout_sfa,
+        "layout_sfb": layout_sfb,
         "topk_weights": topk_weights,
         "topk_ids": topk_ids,
         "m": m,
@@ -389,6 +501,18 @@ def bench_run(
         w2_blockscale,
         w1_gs,
         w2_gs,
+        ab_strides1,
+        ab_strides2,
+        c_strides1,
+        c_strides2,
+        a_ptrs,
+        b_ptrs,
+        out_ptrs,
+        a_scales_ptrs,
+        b_scales_ptrs,
+        alpha_ptrs,
+        layout_sfa,
+        layout_sfb,
         a1_gs,
         a2_gs,
         topk_weights,
@@ -403,7 +527,7 @@ def bench_run(
 
     results.append(
         benchmark.Timer(
-            stmt="run_cutlass_moe_fp4(a, w1_fp4, w2_fp4, w1_blockscale, w2_blockscale, w1_alphas, w2_alphas, a1_gscale, a2_gscale, topk_weights, topk_ids, m, n, k, e, device, num_runs)",  # noqa: E501
+            stmt="run_cutlass_moe_fp4(a, w1_fp4, w2_fp4, w1_blockscale, w2_blockscale, w1_alphas, w2_alphas, ab_strides1, ab_strides2, c_strides1, c_strides2, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs, alpha_ptrs, layout_sfa, layout_sfb, a1_gscale, a2_gscale, topk_weights, topk_ids, m, n, k, e, device, num_runs)",  # noqa: E501
             globals=globals,
             label=label,
             sub_label=sub_label,

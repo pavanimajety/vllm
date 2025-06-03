@@ -391,7 +391,10 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "cutlass_fp4_group_mm(Tensor! out, Tensor a, Tensor b,"
       " Tensor a_blockscale, Tensor b_blockscales, Tensor alphas,"
       " Tensor ab_strides, Tensor c_strides, "
-      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets) -> ()",
+      " Tensor problem_sizes, Tensor expert_offsets, Tensor sf_offsets,"
+      " Tensor a_ptrs, Tensor b_ptrs, Tensor out_ptrs, Tensor a_scales_ptrs, "
+      " Tensor b_scales_ptrs, Tensor alpha_ptrs, Tensor layout_sfa, "
+      " Tensor layout_sfb) -> ()",
       {stride_tag});
   ops.impl("cutlass_fp4_group_mm", torch::kCUDA, &cutlass_fp4_group_mm);
 

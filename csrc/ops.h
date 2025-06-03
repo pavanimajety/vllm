@@ -238,20 +238,17 @@ void cutlass_fp4_group_mm(
     const torch::Tensor& a_blockscale, const torch::Tensor& b_blockscales,
     const torch::Tensor& alphas, const torch::Tensor& ab_strides,
     const torch::Tensor& c_strides, const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets);
+    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets,
+    const torch::Tensor& a_ptrs, const torch::Tensor& b_ptrs,
+    const torch::Tensor& out_ptrs, const torch::Tensor& a_scales_ptrs,
+    const torch::Tensor& b_scales_ptrs, const torch::Tensor& alpha_ptrs,
+    const torch::Tensor& layout_sfa, const torch::Tensor& layout_sfb);
 
 void get_cutlass_moe_mm_data(
     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
     const int64_t num_experts, const int64_t n, const int64_t k, const std::optional<torch::Tensor>& blockscale_offsets);
-
-// void get_cutlass_fp4_moe_mm_data(
-//     const torch::Tensor& topk_ids, torch::Tensor& expert_offsets,
-//     torch::Tensor& blockscale_offsets,
-//     torch::Tensor& problem_sizes1, torch::Tensor& problem_sizes2,
-//     torch::Tensor& input_permutation, torch::Tensor& output_permutation,
-//     const int64_t num_experts, const int64_t n, const int64_t k);
 
 void moe_permute(
     const torch::Tensor& input_tensor,

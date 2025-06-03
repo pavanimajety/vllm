@@ -160,7 +160,11 @@ void run_fp4_blockwise_scaled_group_mm(
     const torch::Tensor& a_blockscale, const torch::Tensor& b_blockscales,
     const torch::Tensor& alphas, const torch::Tensor& ab_strides,
     const torch::Tensor& c_strides, const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets, int M,
+    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets,
+    const torch::Tensor& a_ptrs, const torch::Tensor& b_ptrs,
+    const torch::Tensor& out_ptrs, const torch::Tensor& a_scales_ptrs,
+    const torch::Tensor& b_scales_ptrs, const torch::Tensor& alpha_ptrs,
+    const torch::Tensor& layout_sfa, const torch::Tensor& layout_sfb, int M,
     int N, int K) {
   using ProblemShape =
       cutlass::gemm::GroupProblemShape<Shape<int32_t, int32_t, int32_t>>;
@@ -243,15 +247,16 @@ void run_fp4_blockwise_scaled_group_mm(
   auto options_int =
       torch::TensorOptions().dtype(torch::kInt64).device(a.device());
 
-  torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor alpha_ptrs = torch::empty(num_experts, options_int);
-  torch::Tensor layout_sfa = torch::empty({num_experts, 5}, options_int);
-  torch::Tensor layout_sfb = torch::empty({num_experts, 5}, options_int);
-
+/*
+   torch::Tensor a_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor b_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor out_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor a_scales_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor b_scales_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor alpha_ptrs = torch::empty(num_experts, options_int);
+   torch::Tensor layout_sfa = torch::empty({num_experts, 5}, options_int);
+   torch::Tensor layout_sfb = torch::empty({num_experts, 5}, options_int);
+*/
 
   run_get_group_gemm_starts<LayoutSFA, LayoutSFB, ScaleConfig>(
       a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs, b_scales_ptrs, alpha_ptrs,
@@ -351,7 +356,11 @@ void cutlass_fp4_group_mm(
     const torch::Tensor& alphas, const torch::Tensor& ab_strides,
     const torch::Tensor& c_strides,
     const torch::Tensor& problem_sizes,
-    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets) {
+    const torch::Tensor& expert_offsets, const torch::Tensor& sf_offsets,
+    const torch::Tensor& a_ptrs, const torch::Tensor& b_ptrs,
+    const torch::Tensor& out_ptrs, const torch::Tensor& a_scales_ptrs,
+    const torch::Tensor& b_scales_ptrs, const torch::Tensor& alpha_ptrs,
+    const torch::Tensor& layout_sfa, const torch::Tensor& layout_sfb) {
 #if defined ENABLE_NVFP4 && ENABLE_NVFP4
   // Input validation
   CHECK_INPUT(a, FLOAT4_E2M1X2, "a");
@@ -385,12 +394,14 @@ void cutlass_fp4_group_mm(
     run_fp4_blockwise_scaled_group_mm<cutlass::bfloat16_t>(
         output, a, b, a_blockscale, b_blockscales, alphas,
         ab_strides, c_strides, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs,
+        b_scales_ptrs, alpha_ptrs, layout_sfa, layout_sfb, M, N, K);
   } else {
     run_fp4_blockwise_scaled_group_mm<cutlass::half_t>(
         output, a, b, a_blockscale, b_blockscales, alphas,
         ab_strides, c_strides, problem_sizes,
-        expert_offsets, sf_offsets, M, N, K);
+        expert_offsets, sf_offsets, a_ptrs, b_ptrs, out_ptrs, a_scales_ptrs,
+        b_scales_ptrs, alpha_ptrs, layout_sfa, layout_sfb, M, N, K);
   }
 #else
   TORCH_CHECK_NOT_IMPLEMENTED(
