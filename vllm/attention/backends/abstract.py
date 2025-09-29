@@ -41,8 +41,18 @@ class AttentionBackend(ABC):
     # makes sure the output tensor is allocated inside the cudagraph.
     accept_output_buffer: bool = False
 
+    # Whether this backend supports receiving pre-quantized query input.
+    # If True, the attention layer will handle query quantization instead
+    # of the backend, allowing torch.compile to fuse quantization with
+    # previous operations.
+    # Needs to be worked through for all backends
+    # https://github.com/vllm-project/vllm/issues/25584
+    supports_quant_query_input: bool = False
+
+    # Does attention's forward() include kv cache update?
+    include_kv_cache: bool = True
+
     @staticmethod
-    @abstractmethod
     def get_name() -> str:
         raise NotImplementedError
 
