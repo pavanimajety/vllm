@@ -369,15 +369,16 @@ class Attention(nn.Module, AttentionLayerBase):
                     self, query, key, value, self_kv_cache, attn_metadata, output=output
                 )
             else:
-
-                if self.attn_backend.include_kv_cache:
-                    torch.ops.vllm.unified_attention_with_output(
-                        query, key, value, output, self.layer_name)
-                else:
-                    # torch.ops.vllm.unified_kv_cache_update(
-                    #     key, value, self.layer_name)
-                    torch.ops.vllm.unified_attention_no_kv_cache(
-                        query, key, value, output, self.layer_name)
+                # if self.attn_backend.include_kv_cache:
+                torch.ops.vllm.unified_kv_cache_update(key, value,
+                                                       self.layer_name)
+                torch.ops.vllm.unified_attention_with_output(
+                    query, key, value, output, self.layer_name)
+                # else:
+                #     # torch.ops.vllm.unified_kv_cache_update(
+                #     #     key, value, self.layer_name)
+                #     torch.ops.vllm.unified_attention_no_kv(
+                #         query, key, value, output, self.layer_name)
             return output.view(-1, hidden_size)
         else:
             assert self.attn_backend.include_kv_cache, "Attention backend does not support kv cache"  # noqa: E501
@@ -880,7 +881,7 @@ direct_register_custom_op(
 )
 
 
-def unified_attention_no_kv_cache(
+def unified_attention_no_kv(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -896,22 +897,24 @@ def unified_attention_no_kv_cache(
         attn_metadata = attn_metadata[layer_name]
     self = forward_context.no_compile_layers[layer_name]
     kv_cache = self.kv_cache[forward_context.virtual_engine]
-    self.impl.forward(self,
-                      query,
-                      key,
-                      value,
-                      kv_cache,
-                      attn_metadata,
-                      output=output,
-                      output_scale=output_scale,
-                      output_block_scale=output_block_scale,
-                      should_do_kv_cache_update=False)
+    self.impl.forward(
+        self,
+        query,
+        key,
+        value,
+        kv_cache,
+        attn_metadata,
+        output=output,
+        output_scale=output_scale,
+        output_block_scale=output_block_scale,
+        #   should_do_kv_cache_update=True,
+    )
 
     # TODO keep one of these two
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
 
-def unified_attention_no_kv_cache_fake(
+def unified_attention_no_kv_fake(
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -921,6 +924,16 @@ def unified_attention_no_kv_cache_fake(
     output_block_scale: Optional[torch.Tensor] = None,
 ) -> None:
     return
+
+
+# TODO call self.impl.forward, no kv cache update (pass it as arg)
+direct_register_custom_op(
+    op_name="unified_attention_no_kv",
+    op_func=unified_attention_no_kv,
+    mutates_args=["output", "output_block_scale"],
+    fake_impl=unified_attention_no_kv_fake,
+    tags=tag_cudagraph_unsafe,
+)
 
 
 def unified_kv_cache_update(
@@ -954,14 +967,6 @@ def unified_kv_cache_update_fake(
 ) -> None:
     return
 
-
-# TODO call self.impl.forward, no kv cache update (pass it as arg)
-direct_register_custom_op(
-    op_name="unified_attention_no_kv_cache",
-    op_func=unified_attention_no_kv_cache,
-    fake_impl=unified_attention_no_kv_cache_fake,
-    tags=tag_cudagraph_unsafe,
-)
 
 # TODO call a method on backend and this method should be in superclass of
 # all backends
@@ -997,7 +1002,8 @@ def unified_attention_with_output(
                       attn_metadata,
                       output=output,
                       output_scale=output_scale,
-                      output_block_scale=output_block_scale)
+                      output_block_scale=output_block_scale,
+                      should_do_kv_cache_update=True)
 
     maybe_save_kv_layer_to_connector(layer_name, kv_cache)
 
