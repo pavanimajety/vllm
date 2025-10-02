@@ -3858,30 +3858,27 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 )
             )
 
+            # Force attention for all cudagraph modes. This is required
+            # for KV cache update to be captured correctly in cases where
+            # the KV cache update and attention are two separate custom ops.
+            force_attention = (cudagraph_runtime_mode != CUDAGraphMode.NONE)
             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-                # But be careful, warm up with `NONE`is orthogonal to
-                # if we want to warm up attention or not. This is
-                # different from the case where `FULL` implies capture
-                # attention while `PIECEWISE` implies no attention.
-                force_attention = cudagraph_runtime_mode == CUDAGraphMode.FULL
-                self._dummy_run(
-                    num_tokens,
-                    cudagraph_runtime_mode=CUDAGraphMode.NONE,
-                    force_attention=force_attention,
-                    uniform_decode=uniform_decode,
-                    allow_microbatching=allow_microbatching,
-                    skip_eplb=True,
-                    remove_lora=False,
-                )
-            self._dummy_run(
-                num_tokens,
-                cudagraph_runtime_mode=cudagraph_runtime_mode,
-                uniform_decode=uniform_decode,
-                allow_microbatching=allow_microbatching,
-                skip_eplb=True,
-                remove_lora=False,
-            )
+
+                self._dummy_run(num_tokens,
+                                cudagraph_runtime_mode=CUDAGraphMode.NONE,
+                                force_attention=force_attention,
+                                uniform_decode=uniform_decode,
+                                allow_microbatching=allow_microbatching,
+                                skip_eplb=True,
+                                remove_lora=False)
+            self._dummy_run(num_tokens,
+                            cudagraph_runtime_mode=cudagraph_runtime_mode,
+                            force_attention=force_attention,
+                            uniform_decode=uniform_decode,
+                            allow_microbatching=allow_microbatching,
+                            skip_eplb=True,
+                            remove_lora=False)
         self.maybe_remove_all_loras(self.lora_config)
 
     def initialize_attn_backend(self, kv_cache_config: KVCacheConfig) -> None:
