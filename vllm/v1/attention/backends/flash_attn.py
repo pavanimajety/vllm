@@ -517,7 +517,6 @@ class FlashAttentionImpl(AttentionImpl):
         output: Optional[torch.Tensor] = None,
         output_scale: Optional[torch.Tensor] = None,
         output_block_scale: Optional[torch.Tensor] = None,
-        should_do_kv_cache_update: bool = True,
     ) -> torch.Tensor:
         """Forward pass with FlashAttention.
 
@@ -570,9 +569,6 @@ class FlashAttentionImpl(AttentionImpl):
                 attn_metadata,
                 layer,
             )
-
-        if should_do_kv_cache_update:
-            self.do_kv_cache_update(layer, key, value, kv_cache, attn_metadata)
 
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(0)
