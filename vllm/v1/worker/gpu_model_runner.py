@@ -8,7 +8,8 @@ from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, NamedTuple, TypeAlias, cast
+from enum import Enum, auto
+from typing import TYPE_CHECKING, Any, NamedTuple, Optional, Union, cast
 
 import numpy as np
 import torch
@@ -209,6 +210,12 @@ class AsyncGPUModelRunnerOutput(AsyncModelRunnerOutput):
         output = self._model_runner_output
         output.sampled_token_ids = valid_sampled_token_ids
         return output
+
+
+class ForceAttention(Enum):
+    ALL = auto()
+    SEPARATE_KV_UPDATE_ONLY = auto()
+    NONE = auto()
 
 
 class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
@@ -3183,8 +3190,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
     def _dummy_run(
         self,
         num_tokens: int,
-        cudagraph_runtime_mode: CUDAGraphMode | None = None,
-        force_attention: bool = False,
+        cudagraph_runtime_mode: Optional[CUDAGraphMode] = None,
+        force_attention: ForceAttention = ForceAttention.NONE,
         uniform_decode: bool = False,
         allow_microbatching: bool = True,
         skip_eplb: bool = False,
@@ -3289,9 +3296,13 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
 
         attn_metadata: PerLayerAttnMetadata | None = None
 
-        # If force_attention is True, we always capture attention. Otherwise,
-        # it only happens for cudagraph_runtime_mode=FULL.
-        if force_attention or cudagraph_runtime_mode == CUDAGraphMode.FULL:
+        # We always capture attention if cudagraph_runtime_mode is FULL.
+        # Otherwise, if force_attention is not ALL, we capture attention
+        # for all backends. If it's SEPARATE_KV_UPDATE_ONLY, we capture
+        # attention only for backends that split KV Cache update and
+        # attention op.
+        if (force_attention != ForceAttention.NONE
+                or cudagraph_runtime_mode == CUDAGraphMode.FULL):
             attn_metadata = {}
             if ubatch_slices is not None:
                 attn_metadata = [dict() for _ in range(len(ubatch_slices))]
@@ -3338,6 +3349,14 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                     else None,
                 )
                 for attn_group in self.attn_groups[kv_cache_group_id]:
+                    # Only capture attention for backends that split KV Cache
+                    # update and attention op, unless cudagraph_runtime_mode is
+                    # FULL.
+                    if (force_attention
+                            == ForceAttention.SEPARATE_KV_UPDATE_ONLY
+                            and cudagraph_runtime_mode != CUDAGraphMode.FULL
+                            and attn_group.backend.include_kv_cache):
+                        continue
                     if ubatch_slices is not None:
                         common_attn_metadata_list = split_attn_metadata(
                             ubatch_slices, common_attn_metadata
@@ -3863,21 +3882,25 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
             # for KV cache update to be captured correctly in cases where
             # the KV cache update and attention are two separate custom ops.
             #
-            # Otherwise, use CUDAGraphRuntimeStyle.NONE (default) for warmup.
-            # But be careful, warm up with `NONE`is orthogonal to
+            # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
+            # But be careful, warm up with `NONE` is orthogonal to
             # if we want to warm up attention or not. This is
-            # different from the case where `FULL` implies capture
-            # attention while `PIECEWISE` implies no attention.
-            if all(all(g.backend.include_kv_cache for g in gs)\
-                for gs in self.attn_groups):
-                force_attention_warmup = (
-                    cudagraph_runtime_mode == CUDAGraphMode.FULL)
-                force_attention_dummy = False
-            else:
-                force_attention_warmup = (cudagraph_runtime_mode
-                                          != CUDAGraphMode.NONE)
-                force_attention_dummy = (cudagraph_runtime_mode
-                                         != CUDAGraphMode.NONE)
+            # different from the case where `FULL` implies capture all
+            # attention while `PIECEWISE` implies no attention for backends
+            # that don't split KV Cache update and attention op.
+            has_separate_kv_update = True  #not all(\
+            #all(g.backend.include_kv_cache for g in gs)\
+            #for gs in self.attn_groups)
+            force_attention_dummy = (ForceAttention.SEPARATE_KV_UPDATE_ONLY
+                                     if has_separate_kv_update else
+                                     ForceAttention.NONE)
+            force_attention_warmup = (
+                ForceAttention.ALL if
+                (cudagraph_runtime_mode == CUDAGraphMode.FULL) else
+                (ForceAttention.SEPARATE_KV_UPDATE_ONLY if
+                 (has_separate_kv_update and cudagraph_runtime_mode
+                  != CUDAGraphMode.NONE) else ForceAttention.NONE))
+
             for _ in range(self.compilation_config.cudagraph_num_of_warmups):
                 # Use CUDAGraphRuntimeStyle.NONE (default) for warmup.
 
