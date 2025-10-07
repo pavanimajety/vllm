@@ -41,8 +41,7 @@ class RotaryEmbedding(CustomOp):
         #                        and current_platform.is_cuda()
         #                        and has_flashinfer()
         #                        and self.head_size in [64, 128, 256, 512])
-        self.use_flashinfer = False
-
+        self.use_flashinfer = False 
         cache = self._compute_cos_sin_cache()
         if not self.use_flashinfer:
             cache = cache.to(dtype)
