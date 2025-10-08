@@ -11,6 +11,11 @@ from .rocm_aiter_rope_ops import (
     is_rocm_triton_rotary_embedding_enabled,
     rocm_aiter_rotary_emb,
 )
+from vllm.utils.flashinfer import has_flashinfer
+from vllm.platforms import current_platform
+from vllm.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 @CustomOp.register("rotary_embedding")
@@ -36,12 +41,13 @@ class RotaryEmbedding(CustomOp):
         # TODO(mgoin): disabled for now due to failures
         # Flashinfer only supports head_size=64, 128, 256, 512.
         # https://github.com/flashinfer-ai/flashinfer/blob/ebfd655efe830048dba5d582aaa61d61d1cf9a87/include/flashinfer/utils.cuh#L174-L202
-        # self.use_flashinfer = (self.enabled()
-        #                        and dtype in (torch.float16, torch.bfloat16)
-        #                        and current_platform.is_cuda()
-        #                        and has_flashinfer()
-        #                        and self.head_size in [64, 128, 256, 512])
-        self.use_flashinfer = False 
+        self.use_flashinfer = (self.enabled()
+                            #    and dtype in (torch.float16, torch.bfloat16)
+                               and current_platform.is_cuda()
+                               and has_flashinfer())
+                            #    and self.head_size in [64, 128, 256, 512])
+        if self.use_flashinfer:
+            logger.info(f"Using FlashInfer for Rotary Embedding.")
         cache = self._compute_cos_sin_cache()
         if not self.use_flashinfer:
             cache = cache.to(dtype)
