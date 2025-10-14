@@ -338,10 +338,20 @@ class Attention(nn.Module, AttentionLayerBase):
             # Otherwise queries are quantized using custom ops
             # which causes decoding overheads
             assert self.kv_cache_dtype in {"fp8", "fp8_e4m3"}
-
-            # check if query quantization is supported
-            if self.impl.supports_quant_query_input():
-                query, _ = self.query_quant(query, self._q_scale)
+            query, _ = self.query_quant(query, self._q_scale)
+        
+        update_op = unified_kv_cache_update if self.use_direct_call else torch.ops.vllm.unified_kv_cache_update
+        attention_op = unified_attention_with_output if self.use_direct_call else torch.ops.vllm.unified_attention_with_output
+        if output_shape is None and key is not None and value is not None:
+            output_shape = query.shape
+            output = torch.zeros(output_shape, dtype=output_dtype, device=query.device)
+            query = query.view(-1, self.num_heads, self.head_size) 
+            output = output.view(-1, self.num_heads, self.head_size)
+            key = key.view(-1, self.num_kv_heads, self.head_size)
+            value = value.view(-1, self.num_kv_heads, self.head_size)
+            update_op(key, value, output, self.layer_name)
+            attention_op(query, key, value, output, self.layer_name)
+            return output.view(-1, output_shape[-1])
 
         if self.use_output:
             output_shape = (output_shape
@@ -359,6 +369,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 key = key.view(-1, self.num_kv_heads, self.head_size)
             if value is not None:
                 value = value.view(-1, self.num_kv_heads, self.head_size)
+<<<<<<< HEAD
             if self.use_direct_call:
                 if not self.attn_backend.forward_includes_kv_cache:
                     unified_kv_cache_update(key, value, output, self.layer_name)
@@ -371,6 +382,10 @@ class Attention(nn.Module, AttentionLayerBase):
                         key, value, output, self.layer_name)
                 torch.ops.vllm.unified_attention_with_output(
                     query, key, value, output, self.layer_name)
+=======
+            update_op(key, value, output, self.layer_name)
+            attention_op(query, key, value, output, self.layer_name)
+>>>>>>> 3dcd3bdc5 (wip)
             return output.view(-1, hidden_size)
         else:
 
