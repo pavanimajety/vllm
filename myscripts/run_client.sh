@@ -3,11 +3,15 @@ set +x
 
 INPUT_LEN=1024
 OUTPUT_LEN=1024
-NUM_PROMPTS=128
+NUM_PROMPTS=512
+CONC=2048
+PORT=8087
+HOST=0.0.0.0
+MODEL=nvidia/DeepSeek-R1-0528-FP4
 
 # Wait for server to be ready
 echo "Waiting for server to be ready..."
-while ! curl -s http://0.0.0.0:8000/health > /dev/null; do
+while ! curl -s http://${HOST}:${PORT}/health > /dev/null; do
   echo "Server not ready, waiting 5 seconds..."
   sleep 5
 done
@@ -15,8 +19,11 @@ echo "Server is ready!"
 
 vllm bench serve \
   --backend vllm \
-  --model /models/nvidia-DeepSeek-R1-0528-FP4/ \
+  --host ${HOST} \
+  --port ${PORT} \
+  --model ${MODEL} \
   --num-prompts ${NUM_PROMPTS} \
   --dataset-name random \
   --random-input ${INPUT_LEN} \
-  --random-output ${OUTPUT_LEN}
+  --random-output ${OUTPUT_LEN} \
+  --max-concurrency ${CONC}
