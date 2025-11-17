@@ -1052,7 +1052,20 @@ class DeepseekV2MLAAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        return self.mla_attn(positions, hidden_states)
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"[DEBUG DEEPSEEK MLA] Before mla_attn call:")
+        logger.error(f"  hidden_states: shape={hidden_states.shape}, dtype={hidden_states.dtype}")
+        logger.error(f"  positions: shape={positions.shape}, dtype={positions.dtype}")
+        
+        output = self.mla_attn(positions, hidden_states)
+        
+        logger.error(f"[DEBUG DEEPSEEK MLA] After mla_attn call:")
+        logger.error(f"  output: shape={output.shape}, dtype={output.dtype}")
+        logger.error(f"  output is_contiguous: {output.is_contiguous()}, stride: {output.stride()}")
+        logger.error(f"  output data_ptr: {hex(output.data_ptr())}, alignment: {output.data_ptr() % 16}")
+        
+        return output
 
 
 class DeepseekV2DecoderLayer(nn.Module):

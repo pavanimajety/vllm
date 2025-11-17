@@ -260,6 +260,30 @@ class CutlassMLAImpl(MLACommonImpl[MLACommonMetadata]):
         # Adjust workspace size (if necessary)
         self._workspace.ensure_size(attn_metadata, self._num_kv_splits)
 
+        # DEBUG: Log kernel arguments
+        import logging
+        import torch
+        logger = logging.getLogger(__name__)
+        logger.error(f"[DEBUG MLA DECODE]")
+        logger.error(f"  q_nope: shape={q_nope.shape}, dtype={q_nope.dtype}, device={q_nope.device}")
+        logger.error(f"    - is_contiguous: {q_nope.is_contiguous()}, stride: {q_nope.stride()}")
+        logger.error(f"    - data_ptr: {hex(q_nope.data_ptr())}, alignment: {q_nope.data_ptr() % 16}")
+        logger.error(f"  q_pe: shape={q_pe.shape}, dtype={q_pe.dtype}, device={q_pe.device}")
+        logger.error(f"    - is_contiguous: {q_pe.is_contiguous()}, stride: {q_pe.stride()}")
+        logger.error(f"    - data_ptr: {hex(q_pe.data_ptr())}, alignment: {q_pe.data_ptr() % 16}")
+        logger.error(f"  kv_c_and_k_pe_cache: shape={kv_c_and_k_pe_cache.shape}, dtype={kv_c_and_k_pe_cache.dtype}")
+        logger.error(f"    - is_contiguous: {kv_c_and_k_pe_cache.is_contiguous()}, stride: {kv_c_and_k_pe_cache.stride()}")
+        logger.error(f"    - data_ptr: {hex(kv_c_and_k_pe_cache.data_ptr())}, alignment: {kv_c_and_k_pe_cache.data_ptr() % 16}")
+        logger.error(f"  seq_lens: shape={attn_metadata.decode.seq_lens.shape}, dtype={attn_metadata.decode.seq_lens.dtype}")
+        logger.error(f"  seq_lens values: {attn_metadata.decode.seq_lens}")
+        logger.error(f"  block_table: shape={attn_metadata.decode.block_table.shape}, dtype={attn_metadata.decode.block_table.dtype}")
+        logger.error(f"  block_table (first 5 rows): {attn_metadata.decode.block_table[:5] if len(attn_metadata.decode.block_table) > 0 else 'empty'}")
+        logger.error(f"  workspace: shape={self._workspace.get_buf().shape}, dtype={self._workspace.get_buf().dtype}")
+        logger.error(f"  scale: {self.scale}")
+        logger.error(f"  num_kv_splits: {self._num_kv_splits}")
+        logger.error(f"  kv_lora_rank: {self.kv_lora_rank}")
+        logger.error(f"  qk_rope_head_dim: {self.qk_rope_head_dim}")
+
         # Run MLA
         o, lse = self._sm100_cutlass_mla_decode(
             q_nope,

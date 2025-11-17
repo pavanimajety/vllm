@@ -118,6 +118,21 @@ typename T::Fmha::Arguments args_from_options(
   int page_count_total = kv_c_and_k_pe_cache.sizes()[0];
   int page_size = kv_c_and_k_pe_cache.sizes()[1];
   int max_seq_len = page_size * page_count_per_seq;
+
+  printf("[CUTLASS MLA DEBUG] args_from_options:\n");
+  printf("  q_nope shape = [%ld, %ld, %ld]\n",
+         q_nope.sizes()[0], q_nope.sizes()[1], q_nope.sizes()[2]);
+  printf("  page_table shape = [%ld, %ld]\n",
+         page_table.sizes()[0], page_table.sizes()[1]);
+  printf("  kv_cache shape = [%ld, %ld, %ld]\n",
+         kv_c_and_k_pe_cache.sizes()[0],
+         kv_c_and_k_pe_cache.sizes()[1],
+         kv_c_and_k_pe_cache.sizes()[2]);
+  printf("  page_count_per_seq = %d\n", page_count_per_seq);
+  printf("  page_count_total   = %d\n", page_count_total);
+  printf("  page_size          = %d\n", page_size);
+  printf("  Passing page_count = %d\n", page_count_per_seq);
+  fflush(stdout);
   using TileShapeH = typename T::TileShapeH;
   using TileShapeD = typename T::TileShapeD;
   auto problem_shape = cute::make_tuple(TileShapeH{}, max_seq_len, TileShapeD{}, batches);
@@ -163,7 +178,7 @@ typename T::Fmha::Arguments args_from_options(
        static_cast<int*>(seq_lens.data_ptr()),
        static_cast<int*>(page_table.data_ptr()),
        stride_PT,
-       page_count_total,
+       page_count_per_seq,
        page_size},
       {static_cast<ElementOut*>(out.data_ptr()),
        stride_O,
