@@ -440,6 +440,7 @@ M = TypeVar("M", bound=MLACommonMetadata)
 A = TypeVar("A", bound=AttentionMetadata)
 
 
+@functools.cache
 def use_flashinfer_prefill() -> bool:
     # For blackwell default to flashinfer prefill if it's available since
     # it is faster than FA2.
@@ -454,6 +455,7 @@ def use_flashinfer_prefill() -> bool:
     )
 
 
+@functools.cache
 def use_cudnn_prefill() -> bool:
     from vllm.config import get_current_vllm_config
 
@@ -466,6 +468,7 @@ def use_cudnn_prefill() -> bool:
     )
 
 
+@functools.cache
 def use_trtllm_ragged_deepseek_prefill() -> bool:
     """Check if TRT-LLM ragged DeepSeek prefill should be used."""
     from vllm.config import get_current_vllm_config
@@ -497,6 +500,24 @@ def get_mla_dims(model_config: ModelConfig) -> MLADims:
         qk_rope_head_dim=hf_text_config.qk_rope_head_dim,
         v_head_dim=hf_text_config.v_head_dim,
     )
+
+
+@functools.cache
+def backend_supports_prefill_query_quantization() -> bool:
+    """Check if the selected MLA backend supports prefill query quantization.
+
+    Currently supported backends:
+    - FlashInfer prefill
+    - TRT-LLM ragged DeepSeek prefill
+
+    Not supported:
+    - cuDNN Prefill
+    - FlashAttention
+    """
+    use_fp8_prefill = use_flashinfer_prefill() or use_trtllm_ragged_deepseek_prefill()
+    if use_fp8_prefill:
+        logger.info("Backend supports prefill query quantization")
+    return use_fp8_prefill
 
 
 class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
@@ -574,6 +595,18 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
         self.num_heads = self.model_config.get_num_attention_heads(parallel_config)
         self.mla_dims = get_mla_dims(self.model_config)
         self.aot_schedule = current_platform.is_cuda()
+
+        self.kv_cache_spec = kv_cache_spec
+        self.q_data_type = (
+            current_platform.fp8_dtype()
+            if (
+                vllm_config.cache_config.cache_dtype.startswith("fp8")
+                and vllm_config.attention_config.use_prefill_query_quantization
+                and backend_supports_prefill_query_quantization()
+            )
+            else self.model_config.dtype
+        )
+
         try:
             self.dcp_world_size = get_dcp_group().world_size
             self.dcp_rank = get_dcp_group().rank_in_group
@@ -720,7 +753,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
             sm_scale=self._global_hyperparameters.sm_scale,
             window_left=self._global_hyperparameters.window_left,
             logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
-            q_data_type=self.model_config.dtype,
+            q_data_type=self.q_data_type,
+            o_data_type=prefill.output_dtype,
         )
 
         # Prepare context prefills
@@ -739,7 +773,8 @@ class MLACommonMetadataBuilder(AttentionMetadataBuilder[M]):
                     sm_scale=self._global_hyperparameters.sm_scale,
                     window_left=self._global_hyperparameters.window_left,
                     logits_soft_cap=self._global_hyperparameters.logits_soft_cap,
-                    q_data_type=self.model_config.dtype,
+                    q_data_type=self.q_data_type,
+                    o_data_type=prefill.output_dtype,
                 )
 
         prefill.prefill_main = self._fi_prefill_main
@@ -1322,7 +1357,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-
+        self.supports_prefill_query_quantization = False
         if use_trtllm_ragged_deepseek_prefill():
             logger.info_once(
                 "Using TRT-LLM ragged DeepSeek prefill for MLA", scope="local"
@@ -1332,11 +1367,13 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
             )
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_trtllm_ragged
             self._pad_v = False
+            self.supports_prefill_query_quantization = True
         elif use_flashinfer_prefill():
             logger.info_once("Using FlashInfer prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_fi
             self._run_prefill_new_tokens = self._run_prefill_new_tokens_fi
             self._pad_v = False
+            self.supports_prefill_query_quantization = True
         elif use_cudnn_prefill():
             logger.info_once("Using CUDNN prefill for MLA", scope="local")
             self._run_prefill_context_chunk = self._run_prefill_context_chunk_cudnn
@@ -1540,6 +1577,14 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
 
         assert prefill.query_seq_lens is not None
         assert prefill.workspace_buffer is not None
+        # allocate BF16 / FP16 output tensor for TRT-LLM ragged attention
+        out = torch.empty(
+            q.shape[0],
+            q.shape[1],
+            v.shape[2],
+            device=q.device,
+            dtype=prefill.output_dtype,
+        )
 
         ret = trtllm_ragged_attention_deepseek(
             query=q,
@@ -1652,24 +1697,41 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         workspace = prefill_metadata.chunked_context.workspace
         for i in range(iters):
             toks = prefill_metadata.chunked_context.seq_tot[i]
-            ops.gather_and_maybe_dequant_cache(
-                src_cache=kv_c_and_k_pe_cache,
-                dst=workspace,
-                block_table=prefill_metadata.block_table,
-                cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
-                token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
-                num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
-                kv_cache_dtype=self.kv_cache_dtype,
-                scale=k_scale,
-                seq_starts=prefill_metadata.chunked_context.starts[i],
+            if attn_metadata.prefill.q_data_type != current_platform.fp8_dtype():
+                ops.gather_and_maybe_dequant_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                    token_to_seq=prefill_metadata.chunked_context.token_to_seq[i],
+                    num_tokens=prefill_metadata.chunked_context.chunk_total_token[i],
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    scale=k_scale,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+            else:
+                # FP8 path: gather cache without dequantization
+                ops.cp_gather_cache(
+                    src_cache=kv_c_and_k_pe_cache,
+                    dst=workspace,
+                    block_table=prefill_metadata.block_table,
+                    cu_seq_lens=prefill_metadata.chunked_context.cu_seq_lens[i],
+                    batch_size=attn_metadata.num_prefills,
+                    seq_starts=prefill_metadata.chunked_context.starts[i],
+                )
+
+            # kv_b_proj may not be quantized, for example NVFP4 models.
+            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank].to(
+                self.kv_b_proj.weight.dtype
             )
-
-            kv_c_normed = workspace[:toks][..., : self.kv_lora_rank]
             k_pe = workspace[:toks][..., self.kv_lora_rank :].unsqueeze(1)
-
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
+
+            # To Do: Use epilogue of kv_b_proj to generate fp8 kv_nope.
+            if attn_metadata.prefill.q_data_type == current_platform.fp8_dtype():
+                kv_nope = kv_nope.to(attn_metadata.prefill.q_data_type)
             k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
 
             k = self._concat_k_nope_k_pe(k_nope, k_pe)
@@ -1699,7 +1761,7 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 output = output_tmp
                 output_lse = output_lse_tmp
 
-        return output, output_lse
+        return output, output_lse 
 
     def _context_parallel_compute_prefill_context(
         self,
@@ -1772,11 +1834,38 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
                 toks=toks,
             )
 
+            # Allocate k and v together in layout: [k_nope | k_pe | v]
+            num_tokens = kv_c_normed.shape[0]
+            kv = torch.empty(
+                (
+                    num_tokens,
+                    self.num_heads,
+                    self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim,
+                ),
+                dtype=kv_c_normed.dtype,
+                device=kv_c_normed.device,
+            )
+
+            # kv_b_proj returns [k_nope, v] concatenated - split and write to correct positions
             kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
                 -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
             )
-            k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
-            k = self._concat_k_nope_k_pe(k_nope, k_pe)
+            kv[..., : self.qk_nope_head_dim] = kv_nope[
+                ..., : self.qk_nope_head_dim
+            ]  # k_nope
+            kv[..., self.qk_nope_head_dim + self.qk_rope_head_dim :] = kv_nope[
+                ..., self.qk_nope_head_dim :
+            ]  # v
+
+            # Write k_pe to kv buffer
+            kv[
+                ...,
+                self.qk_nope_head_dim : self.qk_nope_head_dim + self.qk_rope_head_dim,
+            ] = k_pe
+
+            # Create views for k and v
+            k = kv[..., : self.qk_nope_head_dim + self.qk_rope_head_dim]
+            v = kv[..., self.qk_nope_head_dim + self.qk_rope_head_dim :]
 
             attn_output, attn_softmax_lse = self._run_prefill_context_chunk(
                 prefill=prefill_metadata,
@@ -1820,12 +1909,38 @@ class MLACommonImpl(MLACommonBaseImpl[M], Generic[M]):
         assert self.dcp_world_size != -1
 
         has_context = attn_metadata.prefill.chunked_context is not None
+
+        # Allocate k and v together in layout: [k_nope | k_pe | v]
+        num_tokens = kv_c_normed.shape[0]
+        kv = torch.empty(
+            (
+                num_tokens,
+                self.num_heads,
+                self.qk_nope_head_dim + self.qk_rope_head_dim + self.v_head_dim,
+            ),
+            dtype=kv_c_normed.dtype,
+            device=kv_c_normed.device,
+        )
+
+        # kv_b_proj returns [k_nope, v] concatenated - split and write to correct positions
         kv_nope = self.kv_b_proj(kv_c_normed)[0].view(
             -1, self.num_heads, self.qk_nope_head_dim + self.v_head_dim
         )
-        k_nope, v = kv_nope.split([self.qk_nope_head_dim, self.v_head_dim], dim=-1)
+        kv[..., : self.qk_nope_head_dim] = kv_nope[
+            ..., : self.qk_nope_head_dim
+        ]  # k_nope
+        kv[..., self.qk_nope_head_dim + self.qk_rope_head_dim :] = kv_nope[
+            ..., self.qk_nope_head_dim :
+        ]  # v
 
-        k = self._concat_k_nope_k_pe(k_nope, k_pe)
+        # Write k_pe to kv buffer
+        kv[
+            ..., self.qk_nope_head_dim : self.qk_nope_head_dim + self.qk_rope_head_dim
+        ] = k_pe
+
+        # Create views for k and v
+        k = kv[..., : self.qk_nope_head_dim + self.qk_rope_head_dim]
+        v = kv[..., self.qk_nope_head_dim + self.qk_rope_head_dim :]
 
         output_prefill = self._run_prefill_new_tokens(
             prefill=attn_metadata.prefill,
