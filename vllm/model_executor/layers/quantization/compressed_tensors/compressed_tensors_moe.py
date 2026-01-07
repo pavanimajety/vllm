@@ -1465,36 +1465,65 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             f"{layer.activation} not supported for Marlin MoE."
         )
 
+<<<<<<< HEAD
         topk_weights, topk_ids = router.select_experts(
             hidden_states=x,
             router_logits=router_logits,
         )
+=======
+        from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
+        return trtllm_mxint4_block_scale_moe(
+                routing_logits=router_logits.to(torch.float32),  # float
+                routing_bias=layer.e_score_correction_bias.to(x.dtype),
+                hidden_states=x,
+                gemm1_weights=layer.w13_weight_packed.view(torch.uint8),
+                gemm1_weights_scale=layer.w13_weight_scale,
+                gemm1_alpha=None,
+                gemm1_beta=None,
+                gemm1_clamp_limit=None,
+                gemm2_weights=layer.w2_weight_packed.view(torch.uint8),
+                gemm2_weights_scale=layer.w2_weight_scale,
+                num_experts=layer.global_num_experts,
+                top_k=layer.top_k,
+                n_group=layer.num_expert_group,
+                topk_group=layer.topk_group,
+                intermediate_size=layer.intermediate_size_per_partition,
+                local_expert_offset=layer.ep_rank * layer.local_num_experts,
+                local_num_experts=layer.local_num_experts,
+                routed_scaling_factor=layer.routed_scaling_factor,
+                routing_method_type=layer.routing_method_type,
+            ).to(x.dtype)
+        # topk_weights, topk_ids = layer.select_experts(
+        #     hidden_states=x,
+        #     router_logits=router_logits,
+        # )
+>>>>>>> 89d620c16 (add int4-bf16-moe from flashinfer)
 
-        return fused_marlin_moe(
-            x,
-            layer.w13_weight_packed,
-            layer.w2_weight_packed,
-            None,
-            None,
-            layer.w13_weight_scale,
-            layer.w2_weight_scale,
-            router_logits,
-            topk_weights,
-            topk_ids,
-            input_global_scale1=getattr(layer, "w13_input_global_scale", None),
-            input_global_scale2=getattr(layer, "w2_input_global_scale", None),
-            quant_type_id=self.quant_type.id,
-            apply_router_weight_on_input=layer.apply_router_weight_on_input,
-            global_num_experts=layer.global_num_experts,
-            expert_map=layer.expert_map,
-            g_idx1=layer.w13_weight_g_idx,
-            g_idx2=layer.w2_weight_g_idx,
-            sort_indices1=layer.w13_g_idx_sort_indices,
-            sort_indices2=layer.w2_g_idx_sort_indices,
-            workspace=layer.workspace,
-            input_dtype=self.marlin_input_dtype,
-            is_k_full=self.is_k_full,
-        )
+        # return fused_marlin_moe(
+        #     x,
+        #     layer.w13_weight_packed,
+        #     layer.w2_weight_packed,
+        #     None,
+        #     None,
+        #     layer.w13_weight_scale,
+        #     layer.w2_weight_scale,
+        #     router_logits,
+        #     topk_weights,
+        #     topk_ids,
+        #     input_global_scale1=getattr(layer, "w13_input_global_scale", None),
+        #     input_global_scale2=getattr(layer, "w2_input_global_scale", None),
+        #     quant_type_id=self.quant_type.id,
+        #     apply_router_weight_on_input=layer.apply_router_weight_on_input,
+        #     global_num_experts=layer.global_num_experts,
+        #     expert_map=layer.expert_map,
+        #     g_idx1=layer.w13_weight_g_idx,
+        #     g_idx2=layer.w2_weight_g_idx,
+        #     sort_indices1=layer.w13_g_idx_sort_indices,
+        #     sort_indices2=layer.w2_g_idx_sort_indices,
+        #     workspace=layer.workspace,
+        #     input_dtype=self.marlin_input_dtype,
+        #     is_k_full=self.is_k_full,
+        # )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
