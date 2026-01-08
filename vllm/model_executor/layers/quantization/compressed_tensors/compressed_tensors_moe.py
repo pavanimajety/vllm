@@ -66,6 +66,18 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     flashinfer_trtllm_fp4_routed_moe,
     select_nvfp4_gemm_impl,
 )
+<<<<<<< HEAD
+=======
+from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
+    flashinfer_trtllm_mxint4_moe,
+    is_flashinfer_mxint4_moe_available,
+    prepare_static_weights_for_trtllm_mxint4_moe,
+)
+from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
+    FlashinferMoeBackend,
+    get_flashinfer_moe_backend,
+)
+>>>>>>> f3e8a9427 (upd)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy_moe,
@@ -1292,118 +1304,143 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         num_experts = layer.w13_weight_g_idx.shape[0]
         device = layer.w13_weight_g_idx.device
-        is_a_8bit = (
-            self.marlin_input_dtype is not None
-            and self.marlin_input_dtype.itemsize == 1
-        )
-
-        if self.marlin_input_dtype == torch.float8_e4m3fn:
-            # NOTE: for non-zp quantization format only
-            ops.marlin_int4_fp8_preprocess(layer.w13_weight_packed, inplace=True)
-            ops.marlin_int4_fp8_preprocess(layer.w2_weight_packed, inplace=True)
-            layer.w13_weight_scale.data = layer.w13_weight_scale.data * 512
-            layer.w2_weight_scale.data = layer.w2_weight_scale.data * 512
-
-        # when running models with grouped act order,
-        # resort to g_idx values provided in checkpoint
-        if self.actorder == "group":
-            w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
-            w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
-            w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
-            w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
-
-            for e in range(num_experts):
-                w13_g_idx_sort_indices[e] = torch.argsort(layer.w13_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w2_g_idx_sort_indices[e] = torch.argsort(layer.w2_weight_g_idx[e]).to(
-                    torch.int32
-                )
-                w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
-                    w13_g_idx_sort_indices[e]
-                ]
-                w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][w2_g_idx_sort_indices[e]]
-
-            replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
-            replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
-            replace_parameter(layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices)
-            replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
+        if is_flashinfer_mxint4_moe_available():
+            dict_weights_mxint4 = prepare_static_weights_for_trtllm_mxint4_moe(
+                layer.w13_weight_packed,
+                layer.w13_weight_scale,
+                layer.w2_weight_packed,
+                layer.w2_weight_scale,
+            )
+            replace_parameter(
+                layer, "w13_weight_packed", dict_weights_mxint4["gemm1_weights"]
+            )
+            replace_parameter(
+                layer, "w13_weight_scale", dict_weights_mxint4["gemm1_scales"]
+            )
+            replace_parameter(
+                layer, "w2_weight_packed", dict_weights_mxint4["gemm2_weights"]
+            )
+            replace_parameter(
+                layer, "w2_weight_scale", dict_weights_mxint4["gemm2_scales"]
+            )
 
         else:
-            layer.w13_weight_g_idx = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w2_weight_g_idx = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w13_g_idx_sort_indices = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
-            )
-            layer.w2_g_idx_sort_indices = torch.nn.Parameter(
-                torch.empty((num_experts, 0), dtype=torch.int32, device=device),
-                requires_grad=False,
+            is_a_8bit = (
+                self.marlin_input_dtype is not None
+                and self.marlin_input_dtype.itemsize == 1
             )
 
-        marlin_w13_qweight = ops.gptq_marlin_moe_repack(
-            layer.w13_weight_packed,
-            layer.w13_g_idx_sort_indices,
-            layer.w13_weight_packed.shape[1] * self.packed_factor,
-            layer.w13_weight_packed.shape[2],
-            self.num_bits,
-            is_a_8bit=is_a_8bit,
-        )
-        replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+            if self.marlin_input_dtype == torch.float8_e4m3fn:
+                # NOTE: for non-zp quantization format only
+                ops.marlin_int4_fp8_preprocess(layer.w13_weight_packed, inplace=True)
+                ops.marlin_int4_fp8_preprocess(layer.w2_weight_packed, inplace=True)
+                layer.w13_weight_scale.data = layer.w13_weight_scale.data * 512
+                layer.w2_weight_scale.data = layer.w2_weight_scale.data * 512
 
-        marlin_w2_qweight = ops.gptq_marlin_moe_repack(
-            layer.w2_weight_packed,
-            layer.w2_g_idx_sort_indices,
-            layer.w2_weight_packed.shape[1] * self.packed_factor,
-            layer.w2_weight_packed.shape[2],
-            self.num_bits,
-            is_a_8bit=is_a_8bit,
-        )
-        replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+            # when running models with grouped act order,
+            # resort to g_idx values provided in checkpoint
+            if self.actorder == "group":
+                w13_g_idx_sort_indices = torch.empty_like(layer.w13_weight_g_idx)
+                w2_g_idx_sort_indices = torch.empty_like(layer.w2_weight_g_idx)
+                w13_sorted_g_idx = torch.empty_like(layer.w13_weight_g_idx)
+                w2_sorted_g_idx = torch.empty_like(layer.w2_weight_g_idx)
 
-        # Repack scales
-        marlin_w13_scales = marlin_moe_permute_scales(
-            s=layer.w13_weight_scale,
-            size_k=layer.w13_weight_packed.shape[2],
-            size_n=layer.w13_weight_scale.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=is_a_8bit,
-        )
-        if self.marlin_input_dtype == torch.int8 and layer.num_groups_w13 > 1:
-            marlin_w13_scales, w13_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w13_scales
-            )
-            layer.register_parameter(
-                "w13_input_global_scale",
-                torch.nn.Parameter(w13_input_global_scale, requires_grad=False),
-            )
-        replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+                for e in range(num_experts):
+                    w13_g_idx_sort_indices[e] = torch.argsort(
+                        layer.w13_weight_g_idx[e]
+                    ).to(torch.int32)
+                    w2_g_idx_sort_indices[e] = torch.argsort(
+                        layer.w2_weight_g_idx[e]
+                    ).to(torch.int32)
+                    w13_sorted_g_idx[e] = layer.w13_weight_g_idx[e][
+                        w13_g_idx_sort_indices[e]
+                    ]
+                    w2_sorted_g_idx[e] = layer.w2_weight_g_idx[e][
+                        w2_g_idx_sort_indices[e]
+                    ]
 
-        marlin_w2_scales = marlin_moe_permute_scales(
-            s=layer.w2_weight_scale,
-            size_k=layer.w2_weight_scale.shape[1]
-            * (self.group_size if self.group_size != -1 else self.packed_factor),
-            size_n=layer.w2_weight_scale.shape[2],
-            group_size=self.group_size,
-            is_a_8bit=is_a_8bit,
-        )
-        if self.marlin_input_dtype == torch.int8 and layer.num_groups_w2 > 1:
-            marlin_w2_scales, w2_input_global_scale = marlin_act_int8_process_scales(
-                marlin_w2_scales
-            )
-            layer.register_parameter(
-                "w2_input_global_scale",
-                torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
-            )
-        replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+                replace_parameter(layer, "w13_weight_g_idx", w13_sorted_g_idx)
+                replace_parameter(layer, "w2_weight_g_idx", w2_sorted_g_idx)
+                replace_parameter(
+                    layer, "w13_g_idx_sort_indices", w13_g_idx_sort_indices
+                )
+                replace_parameter(layer, "w2_g_idx_sort_indices", w2_g_idx_sort_indices)
 
-        layer.workspace = marlin_make_workspace_new(device, 4)
+            else:
+                layer.w13_weight_g_idx = torch.nn.Parameter(
+                    torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+                layer.w2_weight_g_idx = torch.nn.Parameter(
+                    torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+                layer.w13_g_idx_sort_indices = torch.nn.Parameter(
+                    torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+                layer.w2_g_idx_sort_indices = torch.nn.Parameter(
+                    torch.empty((num_experts, 0), dtype=torch.int32, device=device),
+                    requires_grad=False,
+                )
+
+            marlin_w13_qweight = ops.gptq_marlin_moe_repack(
+                layer.w13_weight_packed,
+                layer.w13_g_idx_sort_indices,
+                layer.w13_weight_packed.shape[1] * self.packed_factor,
+                layer.w13_weight_packed.shape[2],
+                self.num_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w13_weight_packed", marlin_w13_qweight)
+
+            marlin_w2_qweight = ops.gptq_marlin_moe_repack(
+                layer.w2_weight_packed,
+                layer.w2_g_idx_sort_indices,
+                layer.w2_weight_packed.shape[1] * self.packed_factor,
+                layer.w2_weight_packed.shape[2],
+                self.num_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w2_weight_packed", marlin_w2_qweight)
+
+            # Repack scales
+            marlin_w13_scales = marlin_moe_permute_scales(
+                s=layer.w13_weight_scale,
+                size_k=layer.w13_weight_packed.shape[2],
+                size_n=layer.w13_weight_scale.shape[2],
+                group_size=self.group_size,
+                is_a_8bit=is_a_8bit,
+            )
+            if self.marlin_input_dtype == torch.int8 and layer.num_groups_w13 > 1:
+                marlin_w13_scales, w13_input_global_scale = (
+                    marlin_act_int8_process_scales(marlin_w13_scales)
+                )
+                layer.register_parameter(
+                    "w13_input_global_scale",
+                    torch.nn.Parameter(w13_input_global_scale, requires_grad=False),
+                )
+            replace_parameter(layer, "w13_weight_scale", marlin_w13_scales)
+
+            marlin_w2_scales = marlin_moe_permute_scales(
+                s=layer.w2_weight_scale,
+                size_k=layer.w2_weight_scale.shape[1]
+                * (self.group_size if self.group_size != -1 else self.packed_factor),
+                size_n=layer.w2_weight_scale.shape[2],
+                group_size=self.group_size,
+                is_a_8bit=is_a_8bit,
+            )
+            if self.marlin_input_dtype == torch.int8 and layer.num_groups_w2 > 1:
+                marlin_w2_scales, w2_input_global_scale = (
+                    marlin_act_int8_process_scales(marlin_w2_scales)
+                )
+                layer.register_parameter(
+                    "w2_input_global_scale",
+                    torch.nn.Parameter(w2_input_global_scale, requires_grad=False),
+                )
+            replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
+
+            layer.workspace = marlin_make_workspace_new(device, 4)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
@@ -1464,6 +1501,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         assert layer.activation == "silu", (
             f"{layer.activation} not supported for Marlin MoE."
         )
+<<<<<<< HEAD
 
 <<<<<<< HEAD
         topk_weights, topk_ids = router.select_experts(
@@ -1498,32 +1536,67 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         #     router_logits=router_logits,
         # )
 >>>>>>> 89d620c16 (add int4-bf16-moe from flashinfer)
+=======
+        if is_flashinfer_mxint4_moe_available():
+            return flashinfer_trtllm_mxint4_moe(
+                layer=layer,
+                x=x,
+                router_logits=router_logits,
+            )
+        # from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
+        # return trtllm_mxint4_block_scale_moe(
+        #         routing_logits=router_logits.to(torch.float32),  # float
+        #         routing_bias=layer.e_score_correction_bias.to(x.dtype),
+        #         hidden_states=x,
+        #         gemm1_weights=layer.w13_weight_packed.view(torch.uint8),
+        #         gemm1_weights_scale=layer.w13_weight_scale,
+        #         gemm1_alpha=None,
+        #         gemm1_beta=None,
+        #         gemm1_clamp_limit=None,
+        #         gemm2_weights=layer.w2_weight_packed.view(torch.uint8),
+        #         gemm2_weights_scale=layer.w2_weight_scale,
+        #         num_experts=layer.global_num_experts,
+        #         top_k=layer.top_k,
+        #         n_group=layer.num_expert_group,
+        #         topk_group=layer.topk_group,
+        #         intermediate_size=layer.intermediate_size_per_partition,
+        #         local_expert_offset=layer.ep_rank * layer.local_num_experts,
+        #         local_num_experts=layer.local_num_experts,
+        #         routed_scaling_factor=layer.routed_scaling_factor,
+        #         routing_method_type=layer.routing_method_type,
+        #     ).to(x.dtype)
+        else:
+            topk_weights, topk_ids = layer.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+            )
+>>>>>>> f3e8a9427 (upd)
 
-        # return fused_marlin_moe(
-        #     x,
-        #     layer.w13_weight_packed,
-        #     layer.w2_weight_packed,
-        #     None,
-        #     None,
-        #     layer.w13_weight_scale,
-        #     layer.w2_weight_scale,
-        #     router_logits,
-        #     topk_weights,
-        #     topk_ids,
-        #     input_global_scale1=getattr(layer, "w13_input_global_scale", None),
-        #     input_global_scale2=getattr(layer, "w2_input_global_scale", None),
-        #     quant_type_id=self.quant_type.id,
-        #     apply_router_weight_on_input=layer.apply_router_weight_on_input,
-        #     global_num_experts=layer.global_num_experts,
-        #     expert_map=layer.expert_map,
-        #     g_idx1=layer.w13_weight_g_idx,
-        #     g_idx2=layer.w2_weight_g_idx,
-        #     sort_indices1=layer.w13_g_idx_sort_indices,
-        #     sort_indices2=layer.w2_g_idx_sort_indices,
-        #     workspace=layer.workspace,
-        #     input_dtype=self.marlin_input_dtype,
-        #     is_k_full=self.is_k_full,
-        # )
+            return fused_marlin_moe(
+                x,
+                layer.w13_weight_packed,
+                layer.w2_weight_packed,
+                None,
+                None,
+                layer.w13_weight_scale,
+                layer.w2_weight_scale,
+                router_logits,
+                topk_weights,
+                topk_ids,
+                input_global_scale1=getattr(layer, "w13_input_global_scale", None),
+                input_global_scale2=getattr(layer, "w2_input_global_scale", None),
+                quant_type_id=self.quant_type.id,
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=layer.global_num_experts,
+                expert_map=layer.expert_map,
+                g_idx1=layer.w13_weight_g_idx,
+                g_idx2=layer.w2_weight_g_idx,
+                sort_indices1=layer.w13_g_idx_sort_indices,
+                sort_indices2=layer.w2_g_idx_sort_indices,
+                workspace=layer.workspace,
+                input_dtype=self.marlin_input_dtype,
+                is_k_full=self.is_k_full,
+            )
 
 
 class CompressedTensorsWNA16MoEMethod(CompressedTensorsMoEMethod):
