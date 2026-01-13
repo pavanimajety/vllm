@@ -66,8 +66,6 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     flashinfer_trtllm_fp4_routed_moe,
     select_nvfp4_gemm_impl,
 )
-<<<<<<< HEAD
-=======
 from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
     flashinfer_trtllm_mxint4_moe,
     is_flashinfer_mxint4_moe_available,
@@ -77,7 +75,6 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
     FlashinferMoeBackend,
     get_flashinfer_moe_backend,
 )
->>>>>>> f3e8a9427 (upd)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy_moe,
@@ -1501,42 +1498,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         assert layer.activation == "silu", (
             f"{layer.activation} not supported for Marlin MoE."
         )
-<<<<<<< HEAD
-
-<<<<<<< HEAD
-        topk_weights, topk_ids = router.select_experts(
-            hidden_states=x,
-            router_logits=router_logits,
-        )
-=======
-        from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
-        return trtllm_mxint4_block_scale_moe(
-                routing_logits=router_logits.to(torch.float32),  # float
-                routing_bias=layer.e_score_correction_bias.to(x.dtype),
-                hidden_states=x,
-                gemm1_weights=layer.w13_weight_packed.view(torch.uint8),
-                gemm1_weights_scale=layer.w13_weight_scale,
-                gemm1_alpha=None,
-                gemm1_beta=None,
-                gemm1_clamp_limit=None,
-                gemm2_weights=layer.w2_weight_packed.view(torch.uint8),
-                gemm2_weights_scale=layer.w2_weight_scale,
-                num_experts=layer.global_num_experts,
-                top_k=layer.top_k,
-                n_group=layer.num_expert_group,
-                topk_group=layer.topk_group,
-                intermediate_size=layer.intermediate_size_per_partition,
-                local_expert_offset=layer.ep_rank * layer.local_num_experts,
-                local_num_experts=layer.local_num_experts,
-                routed_scaling_factor=layer.routed_scaling_factor,
-                routing_method_type=layer.routing_method_type,
-            ).to(x.dtype)
-        # topk_weights, topk_ids = layer.select_experts(
-        #     hidden_states=x,
-        #     router_logits=router_logits,
-        # )
->>>>>>> 89d620c16 (add int4-bf16-moe from flashinfer)
-=======
         if is_flashinfer_mxint4_moe_available():
             return flashinfer_trtllm_mxint4_moe(
                 layer=layer,
@@ -1566,12 +1527,11 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         #         routing_method_type=layer.routing_method_type,
         #     ).to(x.dtype)
         else:
-            topk_weights, topk_ids = layer.select_experts(
+            
+            topk_weights, topk_ids = router.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
             )
->>>>>>> f3e8a9427 (upd)
-
             return fused_marlin_moe(
                 x,
                 layer.w13_weight_packed,

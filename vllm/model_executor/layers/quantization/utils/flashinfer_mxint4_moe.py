@@ -62,6 +62,15 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
         get_w2_permute_indices_with_cache,
     )
 
+    from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
+        reorder_w1w3_to_w3w1,
+    )
+
+    device = gemm1_weights.device
+    gemm1_weights, gemm1_scales = reorder_w1w3_to_w3w1(
+        gemm1_weights, gemm1_scales, dim=-2
+    )
+
     _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
     num_experts = gemm1_weights.shape[0]
     # Convert quantized weights to proper formats -
@@ -70,6 +79,56 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     gemm2_weights_mxint4 = gemm2_weights.view(torch.uint8)
     assert gemm2_scales.dtype == torch.bfloat16
 
+    # DEBUG: Check scales for zeros (zero scales = NaN output)
+    if device.index == 0:
+        print("\n=== Scale Sanity Check (BEFORE prepare) ===", flush=True)
+        print(
+            "gemm1_scales: "
+            f"min={gemm1_scales.min().item():.6f}, "
+            f"max={gemm1_scales.max().item():.6f}, "
+            f"mean={gemm1_scales.float().mean().item():.6f}",
+            flush=True,
+        )
+        print(
+            "gemm1_scales zero count: "
+            f"{(gemm1_scales == 0).sum().item()} / {gemm1_scales.numel()}",
+            flush=True,
+        )
+        print(
+            "gemm2_scales: "
+            f"min={gemm2_scales.min().item():.6f}, "
+            f"max={gemm2_scales.max().item():.6f}, "
+            f"mean={gemm2_scales.float().mean().item():.6f}",
+            flush=True,
+        )
+        print(
+            "gemm2_scales zero count: "
+            f"{(gemm2_scales == 0).sum().item()} / {gemm2_scales.numel()}",
+            flush=True,
+        )
+        print("=" * 60, flush=True)
+    if device.index == 0:
+        print(
+            "prepare_static_weights_for_trtllm_mxint4_moe BEFORE TRANSFORM - ",
+            flush=True,
+        )
+        print(
+            f"gemm1_weights shape: {gemm1_weights.shape}, dtype: {gemm1_weights.dtype}",
+            flush=True,
+        )
+        print(
+            f"gemm1_scales shape: {gemm1_scales.shape}, dtype: {gemm1_scales.dtype}",
+            flush=True,
+        )
+        print(
+            f"gemm2_weights shape: {gemm2_weights.shape}, dtype: {gemm2_weights.dtype}",
+            flush=True,
+        )
+        print(
+            f"gemm2_scales shape: {gemm2_scales.shape}, dtype: {gemm2_scales.dtype}",
+            flush=True,
+        )
+        print("--" * 10, flush=True)
     epilogue_tile_m = 128
     gemm1_weights_mxint4_shuffled = []
     gemm1_scales_shuffled = []
@@ -94,11 +153,9 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
             gemm1_scales[i],
             epilogue_tile_m,
             num_elts_per_sf=32,
-        )
+        ).to(device)
         gemm1_scales_shuffled.append(
-            block_scale_interleave(
-                gemm1_scales[i][permute_sf_indices.to(gemm1_scales.device)].contiguous()
-            )
+            block_scale_interleave(gemm1_scales[i][permute_sf_indices].contiguous())
         )
 
         permute_indices = get_w2_permute_indices_with_cache(
@@ -124,7 +181,7 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
 
         block_k = 128
         gemm1_weights_shuffled = convert_to_block_layout(
-            gemm1_weights_shuffled, block_k
+            gemm1_weights_shuffled.view(torch.uint8), block_k
         )
         gemm2_weights_shuffled = convert_to_block_layout(
             gemm2_weights_shuffled.view(torch.uint8), block_k
@@ -137,7 +194,6 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     gemm2_weights_mxint4_shuffled = torch.stack(gemm2_weights_mxint4_shuffled)
     gemm1_scales_shuffled = torch.stack(gemm1_scales_shuffled).view(torch.bfloat16)
     gemm2_scales_shuffled = torch.stack(gemm2_scales_shuffled).view(torch.bfloat16)
-
     return {
         "gemm1_weights": gemm1_weights_mxint4_shuffled,
         "gemm1_scales": gemm1_scales_shuffled,
@@ -166,32 +222,75 @@ def flashinfer_trtllm_mxint4_moe(
     from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
 
     assert x.dtype == torch.bfloat16
-    assert layer.w13_weight.dtype == torch.uint8
-    assert layer.w13_weight_scale.dtype == torch.bfloat16
-    assert layer.w2_weight.dtype == torch.uint8
-    assert layer.w2_weight_scale.dtype == torch.bfloat16
+    assert layer.w13_weight_packed.dtype == torch.uint8, (
+        f"w13_weight_packed dtype: {layer.w13_weight_packed.dtype}"
+    )
+    assert layer.w13_weight_scale.dtype == torch.bfloat16, (
+        f"w13_weight_scale dtype: {layer.w13_weight_scale.dtype}"
+    )
+    assert layer.w2_weight_packed.dtype == torch.uint8, (
+        f"w2_weight_packed dtype: {layer.w2_weight_packed.dtype}"
+    )
+    assert layer.w2_weight_scale.dtype == torch.bfloat16, (
+        f"w2_weight_scale dtype: {layer.w2_weight_scale.dtype}"
+    )
 
     routing_bias = None
     if layer.e_score_correction_bias is not None:
         routing_bias = layer.e_score_correction_bias.to(torch.bfloat16)
 
-    # DeepSeekV3 requires float32 routing logits
     if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
         router_logits = router_logits.to(torch.float32)
-
-    # Call MxInt4 kernel (simpler than FP4!)
+    # if x.device.index == 0:
+    # print("=================kernel print===================", flush=True)
+    # print(
+    #     f"shapes: w13_weight_packed: {layer.w13_weight_packed.shape}",
+    #     flush=True,
+    # )
+    # print(
+    #     f"shapes: w2_weight_packed: {layer.w2_weight_packed.shape}",
+    #     flush=True,
+    # )
+    # print(
+    #     f"shapes: w13_weight_scale: {layer.w13_weight_scale.shape}",
+    #     flush=True,
+    # )
+    # print(
+    #     f"shapes: w2_weight_scale: {layer.w2_weight_scale.shape}",
+    #     flush=True,
+    # )
+    # print(
+    #     f"shapes: w2_weight : {layer.w2_weight_packed.shape}",
+    #     flush=True,
+    # )
+    # print(f"routing_logits.shape: {router_logits.shape}", flush=True)
+    # print(f"routing_logits.dtype: {router_logits.dtype}", flush=True)
+    # print(f"routing_bias.shape: {routing_bias.shape}", flush=True)
+    # print(f"routing_bias.dtype: {routing_bias.dtype}", flush=True)
+    # print(f"x.shape: {x.shape}", flush=True)
+    # print(f"layer.global_num_experts: {layer.global_num_experts}", flush=True)
+    # print(f"layer.top_k: {layer.top_k}", flush=True)
+    # print(f"layer.num_expert_group: {layer.num_expert_group}", flush=True)
+    # print(f"layer.topk_group: {layer.topk_group}", flush=True)
+    # print(f"layer.routed_scaling_factor: {layer.routed_scaling_factor}", flush=True)
+    # print(
+    #     "layer.intermediate_size_per_partition: "
+    #     f"{layer.intermediate_size_per_partition}",
+    #     flush=True,
+    # )
+    # print("-" * 100, flush=True)
     out = trtllm_mxint4_block_scale_moe(
         routing_logits=router_logits,
         routing_bias=routing_bias,
-        hidden_states=x,  # Direct bf16, no quantization!
-        gemm1_weights=layer.w13_weight.data,
+        hidden_states=x,
+        gemm1_weights=layer.w13_weight_packed.data,
         gemm1_weights_scale=layer.w13_weight_scale.data,
         gemm1_alpha=layer.gemm1_alpha.data if hasattr(layer, "gemm1_alpha") else None,
         gemm1_beta=layer.gemm1_beta.data if hasattr(layer, "gemm1_beta") else None,
         gemm1_clamp_limit=layer.gemm1_clamp_limit.data
         if hasattr(layer, "gemm1_clamp_limit")
         else None,
-        gemm2_weights=layer.w2_weight.data,
+        gemm2_weights=layer.w2_weight_packed.data,
         gemm2_weights_scale=layer.w2_weight_scale.data,
         num_experts=layer.global_num_experts,
         top_k=layer.top_k,
@@ -200,11 +299,41 @@ def flashinfer_trtllm_mxint4_moe(
         intermediate_size=layer.intermediate_size_per_partition,
         local_expert_offset=layer.ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
-        routed_scaling_factor=None,
+        routed_scaling_factor=2.827,
         routing_method_type=layer.routing_method_type,
-        enable_pdl=None,  # Auto-detect
+        enable_pdl=None,
         output=None,
         tune_max_num_tokens=8192,
-    )[0]
+    ).to(x.dtype)
+
+    # DEBUG: Check output statistics
+    if x.device.index == 0:
+        print("\n=== MoE Output Check ===", flush=True)
+        print(f"Output shape: {out.shape}", flush=True)
+        print(f"Output dtype: {out.dtype}", flush=True)
+        print(
+            f"Input (x): min={x.min().item():.6f}, "
+            f"max={x.max().item():.6f}, "
+            f"mean={x.float().mean().item():.6f}, "
+            f"std={x.float().std().item():.6f}",
+            flush=True,
+        )
+        print(
+            f"Output: min={out.min().item():.6f}, "
+            f"max={out.max().item():.6f}, "
+            f"mean={out.float().mean().item():.6f}, "
+            f"std={out.float().std().item():.6f}",
+            flush=True,
+        )
+        print(f"Output has NaN: {torch.isnan(out).any().item()}", flush=True)
+        print(f"Output has Inf: {torch.isinf(out).any().item()}", flush=True)
+        # Check for repetitive values (sign of garbage)
+        unique_vals = torch.unique(out[:10, :10])  # Sample first 10x10
+        print(
+            "Unique values in sample (first 10x10): "
+            f"{len(unique_vals)} / {min(100, out.numel())}",
+            flush=True,
+        )
+        print("=" * 60, flush=True)
 
     return out
