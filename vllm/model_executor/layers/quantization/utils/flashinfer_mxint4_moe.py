@@ -67,6 +67,18 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     )
 
     device = gemm1_weights.device
+    assert gemm1_weights.ndim == 3, (
+        f"Expected a 3D gemm1_weights tensor, got {gemm1_weights.shape}"
+    )
+    assert gemm1_scales.ndim == 3, (
+        f"Expected a 3D gemm1_scales tensor, got {gemm1_scales.shape}"
+    )
+    assert gemm2_weights.ndim == 3, (
+        f"Expected a 3D gemm2_weights tensor, got {gemm2_weights.shape}"
+    )
+    assert gemm2_scales.ndim == 3, (
+        f"Expected a 3D gemm2_scales tensor, got {gemm2_scales.shape}"
+    )
     gemm1_weights, gemm1_scales = reorder_w1w3_to_w3w1(
         gemm1_weights, gemm1_scales, dim=-2
     )
@@ -79,56 +91,6 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     gemm2_weights_mxint4 = gemm2_weights.view(torch.uint8)
     assert gemm2_scales.dtype == torch.bfloat16
 
-    # DEBUG: Check scales for zeros (zero scales = NaN output)
-    if device.index == 0:
-        print("\n=== Scale Sanity Check (BEFORE prepare) ===", flush=True)
-        print(
-            "gemm1_scales: "
-            f"min={gemm1_scales.min().item():.6f}, "
-            f"max={gemm1_scales.max().item():.6f}, "
-            f"mean={gemm1_scales.float().mean().item():.6f}",
-            flush=True,
-        )
-        print(
-            "gemm1_scales zero count: "
-            f"{(gemm1_scales == 0).sum().item()} / {gemm1_scales.numel()}",
-            flush=True,
-        )
-        print(
-            "gemm2_scales: "
-            f"min={gemm2_scales.min().item():.6f}, "
-            f"max={gemm2_scales.max().item():.6f}, "
-            f"mean={gemm2_scales.float().mean().item():.6f}",
-            flush=True,
-        )
-        print(
-            "gemm2_scales zero count: "
-            f"{(gemm2_scales == 0).sum().item()} / {gemm2_scales.numel()}",
-            flush=True,
-        )
-        print("=" * 60, flush=True)
-    if device.index == 0:
-        print(
-            "prepare_static_weights_for_trtllm_mxint4_moe BEFORE TRANSFORM - ",
-            flush=True,
-        )
-        print(
-            f"gemm1_weights shape: {gemm1_weights.shape}, dtype: {gemm1_weights.dtype}",
-            flush=True,
-        )
-        print(
-            f"gemm1_scales shape: {gemm1_scales.shape}, dtype: {gemm1_scales.dtype}",
-            flush=True,
-        )
-        print(
-            f"gemm2_weights shape: {gemm2_weights.shape}, dtype: {gemm2_weights.dtype}",
-            flush=True,
-        )
-        print(
-            f"gemm2_scales shape: {gemm2_scales.shape}, dtype: {gemm2_scales.dtype}",
-            flush=True,
-        )
-        print("--" * 10, flush=True)
     epilogue_tile_m = 128
     gemm1_weights_mxint4_shuffled = []
     gemm1_scales_shuffled = []
@@ -241,44 +203,7 @@ def flashinfer_trtllm_mxint4_moe(
 
     if layer.routing_method_type == RoutingMethodType.DeepSeekV3:
         router_logits = router_logits.to(torch.float32)
-    # if x.device.index == 0:
-    # print("=================kernel print===================", flush=True)
-    # print(
-    #     f"shapes: w13_weight_packed: {layer.w13_weight_packed.shape}",
-    #     flush=True,
-    # )
-    # print(
-    #     f"shapes: w2_weight_packed: {layer.w2_weight_packed.shape}",
-    #     flush=True,
-    # )
-    # print(
-    #     f"shapes: w13_weight_scale: {layer.w13_weight_scale.shape}",
-    #     flush=True,
-    # )
-    # print(
-    #     f"shapes: w2_weight_scale: {layer.w2_weight_scale.shape}",
-    #     flush=True,
-    # )
-    # print(
-    #     f"shapes: w2_weight : {layer.w2_weight_packed.shape}",
-    #     flush=True,
-    # )
-    # print(f"routing_logits.shape: {router_logits.shape}", flush=True)
-    # print(f"routing_logits.dtype: {router_logits.dtype}", flush=True)
-    # print(f"routing_bias.shape: {routing_bias.shape}", flush=True)
-    # print(f"routing_bias.dtype: {routing_bias.dtype}", flush=True)
-    # print(f"x.shape: {x.shape}", flush=True)
-    # print(f"layer.global_num_experts: {layer.global_num_experts}", flush=True)
-    # print(f"layer.top_k: {layer.top_k}", flush=True)
-    # print(f"layer.num_expert_group: {layer.num_expert_group}", flush=True)
-    # print(f"layer.topk_group: {layer.topk_group}", flush=True)
-    # print(f"layer.routed_scaling_factor: {layer.routed_scaling_factor}", flush=True)
-    # print(
-    #     "layer.intermediate_size_per_partition: "
-    #     f"{layer.intermediate_size_per_partition}",
-    #     flush=True,
-    # )
-    # print("-" * 100, flush=True)
+
     out = trtllm_mxint4_block_scale_moe(
         routing_logits=router_logits,
         routing_bias=routing_bias,
@@ -299,8 +224,8 @@ def flashinfer_trtllm_mxint4_moe(
         intermediate_size=layer.intermediate_size_per_partition,
         local_expert_offset=layer.ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
-        routed_scaling_factor=2.827,
-        routing_method_type=layer.routing_method_type,
+        routed_scaling_factor=1.0,
+        routing_method_type=RoutingMethodType.DeepSeekV3,
         enable_pdl=None,
         output=None,
         tune_max_num_tokens=8192,

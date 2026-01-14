@@ -71,10 +71,6 @@ from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import 
     is_flashinfer_mxint4_moe_available,
     prepare_static_weights_for_trtllm_mxint4_moe,
 )
-from vllm.model_executor.layers.quantization.utils.flashinfer_utils import (
-    FlashinferMoeBackend,
-    get_flashinfer_moe_backend,
-)
 from vllm.model_executor.layers.quantization.utils.fp8_utils import (
     process_fp8_input_tensor_strategy_moe,
     process_fp8_weight_tensor_strategy_moe,
@@ -1155,6 +1151,76 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         self.quant_type = WNA16_SUPPORTED_TYPES_MAP[self.num_bits]
         self.use_marlin = True
         self.marlin_input_dtype = get_marlin_input_dtype(layer_name)
+        self.use_flashinfer_mxint4_moe = is_flashinfer_mxint4_moe_available()
+
+    def get_weight_shape(
+        self,
+        weight_name: str,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        num_groups_w2: int | None = None,
+        num_groups_w13: int | None = None,
+    ) -> tuple[int, int, int]:
+        """
+        Get the shape of the weight based on the weight name, number of experts
+        hidden size, intermediate size per partition, number of groups for w2,
+        and number of groups for w13. Pass in num_groups_w2 and num_groups_w13
+        for weight scales.
+        """
+        if weight_name == "w13_scale":
+            assert num_groups_w13 is not None, (
+                "num_groups_w13 must be provided for weight scales"
+            )
+        if weight_name == "w2_weight_scale":
+            assert num_groups_w2 is not None, (
+                "num_groups_w2 must be provided for weight scales"
+            )
+        shape_map = {
+            "w13_weight": {
+                "flashinfer": (
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    hidden_size // self.packed_factor,
+                ),
+                "standard": (
+                    num_experts,
+                    hidden_size // self.packed_factor,
+                    2 * intermediate_size_per_partition,
+                ),
+            },
+            "w13_scale": {
+                "flashinfer": (
+                    num_experts,
+                    2 * intermediate_size_per_partition,
+                    num_groups_w13,
+                ),
+                "standard": (
+                    num_experts,
+                    num_groups_w13,
+                    2 * intermediate_size_per_partition,
+                ),
+            },
+            "w2_weight": {
+                "flashinfer": (
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition // self.packed_factor,
+                ),
+                "standard": (
+                    num_experts,
+                    intermediate_size_per_partition // self.packed_factor,
+                    hidden_size,
+                ),
+            },
+            "w2_scale": {
+                "flashinfer": (num_experts, hidden_size, num_groups_w2),
+                "standard": (num_experts, num_groups_w2, hidden_size),
+            },
+        }
+
+        shape_key = "flashinfer" if self.use_flashinfer_mxint4_moe else "standard"
+        return shape_map[weight_name][shape_key]
 
     def create_weights(
         self,
@@ -1170,14 +1236,19 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         # Will transpose the loaded weight along the
         # intermediate and hidden dim sizes. Will
         # shard for TP along the transposed dims
+        is_transposed = not self.use_flashinfer_mxint4_moe
         extra_weight_attrs.update(
-            {"is_transposed": True, "quant_method": self.strategy}
+            {"is_transposed": is_transposed, "quant_method": self.strategy}
         )
+
         w13_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
-                hidden_size // self.packed_factor,
-                2 * intermediate_size_per_partition,
+                *self.get_weight_shape(
+                    "w13_weight",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                ),
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -1187,9 +1258,12 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         w2_weight = torch.nn.Parameter(
             torch.empty(
-                num_experts,
-                intermediate_size_per_partition // self.packed_factor,
-                hidden_size,
+                *self.get_weight_shape(
+                    "w2_weight",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                ),
                 dtype=torch.int32,
             ),
             requires_grad=False,
@@ -1220,9 +1294,13 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         w13_scale = torch.nn.Parameter(
             torch.ones(
-                num_experts,
-                num_groups_w13,
-                2 * intermediate_size_per_partition,
+                *self.get_weight_shape(
+                    "w13_scale",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    num_groups_w13=num_groups_w13,
+                ),
                 dtype=params_dtype,
             ),
             requires_grad=False,
@@ -1231,7 +1309,16 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         set_weight_attrs(w13_scale, extra_weight_attrs)
 
         w2_scale = torch.nn.Parameter(
-            torch.ones(num_experts, num_groups_w2, hidden_size, dtype=params_dtype),
+            torch.ones(
+                *self.get_weight_shape(
+                    "w2_scale",
+                    num_experts,
+                    hidden_size,
+                    intermediate_size_per_partition,
+                    num_groups_w2=num_groups_w2,
+                ),
+                dtype=params_dtype,
+            ),
             requires_grad=False,
         )
         layer.register_parameter("w2_weight_scale", w2_scale)
@@ -1504,30 +1591,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
                 x=x,
                 router_logits=router_logits,
             )
-        # from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
-        # return trtllm_mxint4_block_scale_moe(
-        #         routing_logits=router_logits.to(torch.float32),  # float
-        #         routing_bias=layer.e_score_correction_bias.to(x.dtype),
-        #         hidden_states=x,
-        #         gemm1_weights=layer.w13_weight_packed.view(torch.uint8),
-        #         gemm1_weights_scale=layer.w13_weight_scale,
-        #         gemm1_alpha=None,
-        #         gemm1_beta=None,
-        #         gemm1_clamp_limit=None,
-        #         gemm2_weights=layer.w2_weight_packed.view(torch.uint8),
-        #         gemm2_weights_scale=layer.w2_weight_scale,
-        #         num_experts=layer.global_num_experts,
-        #         top_k=layer.top_k,
-        #         n_group=layer.num_expert_group,
-        #         topk_group=layer.topk_group,
-        #         intermediate_size=layer.intermediate_size_per_partition,
-        #         local_expert_offset=layer.ep_rank * layer.local_num_experts,
-        #         local_num_experts=layer.local_num_experts,
-        #         routed_scaling_factor=layer.routed_scaling_factor,
-        #         routing_method_type=layer.routing_method_type,
-        #     ).to(x.dtype)
         else:
-            
             topk_weights, topk_ids = router.select_experts(
                 hidden_states=x,
                 router_logits=router_logits,
