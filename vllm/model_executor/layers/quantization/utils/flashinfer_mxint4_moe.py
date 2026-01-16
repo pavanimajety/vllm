@@ -45,9 +45,11 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     Prepare MxInt4 weights for TRT-LLM kernel.
 
     Input:
-        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size//2] uint8
+        gemm1_weights: [num_experts, 2*intermediate_size, hidden_size//8] int32
+            (checkpoint uint4b8 packed) or uint8 (already packed signed int4)
         gemm1_scales: [num_experts, 2*intermediate_size, hidden_size//32] bf16
-        gemm2_weights: [num_experts, hidden_size, intermediate_size] uint8
+        gemm2_weights: [num_experts, hidden_size, intermediate_size//8] int32
+            (checkpoint uint4b8 packed) or uint8 (already packed signed int4)
         gemm2_scales: [num_experts, hidden_size, intermediate_size//32] bf16
 
     Returns:
@@ -65,6 +67,9 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
         reorder_w1w3_to_w3w1,
     )
+    from vllm.model_executor.layers.quantization.utils.quant_utils import (
+        convert_packed_uint4b8_to_signed_int4_inplace,
+    )
 
     device = gemm1_weights.device
     assert gemm1_weights.ndim == 3, (
@@ -79,12 +84,20 @@ def prepare_static_weights_for_trtllm_mxint4_moe(
     assert gemm2_scales.ndim == 3, (
         f"Expected a 3D gemm2_scales tensor, got {gemm2_scales.shape}"
     )
+
+    # Convert checkpoint format (uint4b8 in int32) to signed int4
+    # Checkpoint stores INT4 as unsigned [0, 15], kernel expects signed [-8, 7]
+    if gemm1_weights.dtype == torch.int32 and gemm2_weights.dtype == torch.int32:
+        convert_packed_uint4b8_to_signed_int4_inplace(gemm1_weights)
+        convert_packed_uint4b8_to_signed_int4_inplace(gemm2_weights)
+
     gemm1_weights, gemm1_scales = reorder_w1w3_to_w3w1(
         gemm1_weights, gemm1_scales, dim=-2
     )
 
     _cache_permute_indices: dict[torch.Size, torch.Tensor] = {}
     num_experts = gemm1_weights.shape[0]
+
     # Convert quantized weights to proper formats -
     gemm1_weights_mxint4 = gemm1_weights.view(torch.uint8)
     assert gemm1_scales.dtype == torch.bfloat16
@@ -224,41 +237,11 @@ def flashinfer_trtllm_mxint4_moe(
         intermediate_size=layer.intermediate_size_per_partition,
         local_expert_offset=layer.ep_rank * layer.local_num_experts,
         local_num_experts=layer.local_num_experts,
-        routed_scaling_factor=1.0,
-        routing_method_type=RoutingMethodType.DeepSeekV3,
+        routed_scaling_factor=None,
+        routing_method_type=layer.routing_method_type,
         enable_pdl=None,
         output=None,
         tune_max_num_tokens=8192,
     ).to(x.dtype)
-
-    # DEBUG: Check output statistics
-    if x.device.index == 0:
-        print("\n=== MoE Output Check ===", flush=True)
-        print(f"Output shape: {out.shape}", flush=True)
-        print(f"Output dtype: {out.dtype}", flush=True)
-        print(
-            f"Input (x): min={x.min().item():.6f}, "
-            f"max={x.max().item():.6f}, "
-            f"mean={x.float().mean().item():.6f}, "
-            f"std={x.float().std().item():.6f}",
-            flush=True,
-        )
-        print(
-            f"Output: min={out.min().item():.6f}, "
-            f"max={out.max().item():.6f}, "
-            f"mean={out.float().mean().item():.6f}, "
-            f"std={out.float().std().item():.6f}",
-            flush=True,
-        )
-        print(f"Output has NaN: {torch.isnan(out).any().item()}", flush=True)
-        print(f"Output has Inf: {torch.isinf(out).any().item()}", flush=True)
-        # Check for repetitive values (sign of garbage)
-        unique_vals = torch.unique(out[:10, :10])  # Sample first 10x10
-        print(
-            "Unique values in sample (first 10x10): "
-            f"{len(unique_vals)} / {min(100, out.numel())}",
-            flush=True,
-        )
-        print("=" * 60, flush=True)
 
     return out

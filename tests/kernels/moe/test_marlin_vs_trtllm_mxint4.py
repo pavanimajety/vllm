@@ -9,7 +9,6 @@ from vllm.model_executor.layers.fused_moe.fused_marlin_moe import (
     fused_marlin_moe,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
-    is_flashinfer_mxint4_moe_available,
     prepare_static_weights_for_trtllm_mxint4_moe,
 )
 from vllm.platforms import current_platform
@@ -60,7 +59,7 @@ def noaux_tc_ref(logits, bias, n_group, topk_group, top_k, routed_scaling_factor
 def mxint4_quantize(
     x: torch.Tensor, sf_vec_size: int = 32
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize BF16 tensor to MXINT4 with block scaling (group_size=32).
+    """Quantize BF16 tensor to MXINT4 with block scaling (group_size=sf_vec_size).
 
     Returns:
         - uint8 packed (2 INT4/byte): [..., k//2] - stores SIGNED INT4 [-8, 7]
@@ -83,25 +82,93 @@ def mxint4_quantize(
     )
 
 
-@pytest.mark.skipif(
-    not is_flashinfer_mxint4_moe_available(),
-    reason="FlashInfer TRT-LLM MXINT4 MoE not available",
-)
+def mxint4_quantize_moe_weights(
+    weights_bf16: torch.Tensor, group_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize MoE weights [e, n, k] to MxInt4 format.
+
+    Args:
+        weights_bf16: BF16 weights of shape [num_experts, out_features, in_features]
+        group_size: Quantization group size (default: 32)
+
+    Returns:
+        - weights_mxint4: Quantized weights [e, n, k//2] uint8
+        - scales_mxint4: Quantization scales [e, n, k//group_size] bf16
+    """
+    e = weights_bf16.shape[0]
+    weight_list = []
+    scale_list = []
+
+    for i in range(e):
+        w_q, w_s = mxint4_quantize(weights_bf16[i], sf_vec_size=group_size)
+        weight_list.append(w_q)
+        scale_list.append(w_s)
+
+    return torch.stack(weight_list), torch.stack(scale_list)
+
+
+__all__ = [
+    "mxint4_quantize",
+    "mxint4_quantize_moe_weights",
+    "marlin_quantize_moe_weights",
+]
+
+
+def marlin_quantize_moe_weights(
+    weights_bf16: torch.Tensor, group_size: int = 32
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize MoE weights [e, n, k] to Marlin INT4 format.
+
+    Args:
+        weights_bf16: BF16 weights of shape [num_experts, out_features, in_features]
+        group_size: Quantization group size (default: 32)
+
+    Returns:
+        - weights_marlin: Marlin quantized weights [e, k//8, n] int32
+        - scales_marlin: Marlin quantization scales [e, k//group_size, n] bf16
+    """
+    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
+        marlin_quantize,
+    )
+
+    e, n, k = weights_bf16.shape
+    weight_list = []
+    scale_list = []
+
+    for i in range(e):
+        # Transpose for Marlin: [n, k] → [k, n]
+        w_t = weights_bf16[i].T.contiguous()
+        _, w_q, w_s, _, _, _ = marlin_quantize(
+            w_t, scalar_types.uint4b8, group_size, act_order=False
+        )
+        weight_list.append(w_q)
+        scale_list.append(w_s)
+
+    # Stack to get [e, ...] shape
+    weights_marlin = torch.stack(weight_list)  # [e, k // 8, n]
+    scales_marlin = torch.stack(scale_list)  # [e, k // group_size, n]
+
+    return weights_marlin, scales_marlin
+
+
 @pytest.mark.skipif(current_platform.is_rocm(), reason="Skip for rocm")
 @pytest.mark.parametrize("m", [1, 33])
 @pytest.mark.parametrize("n", [7168])
 @pytest.mark.parametrize("k", [512])
 @pytest.mark.parametrize("e", [384])
-@pytest.mark.parametrize("topk", [8])  # DeepSeekV3 default: num_experts_per_tok=8
-def test_marlin_vs_trtllm_mxint4_moe(m, n, k, e, topk):
+@pytest.mark.parametrize("topk", [8])
+@pytest.mark.parametrize("group_size", [32])
+def test_marlin_vs_trtllm_mxint4_moe_kimik2(monkeypatch, m, n, k, e, topk, group_size):
     """Compare Marlin INT4 MoE vs FlashInfer TRT-LLM MXINT4 MoE.
 
     Uses mxint4_quantize() to generate common INT4 weights + BF16 scales,
     then runs both Marlin and TRT-LLM kernels and compares outputs.
     """
+    pytest.importorskip("flashinfer")
+    monkeypatch.setenv("VLLM_USE_FLASHINFER_MOE_INT4", "1")
+
     torch.cuda.manual_seed(0)
 
-    group_size = 32
     dtype = torch.bfloat16
 
     # DeepSeekV3 routing config (from Kimi-K2-Thinking config.json)
@@ -126,41 +193,9 @@ def test_marlin_vs_trtllm_mxint4_moe(m, n, k, e, topk):
     w2_bf16 = torch.randn((e, k, n), device="cuda", dtype=dtype) * std_w2
 
     # === Marlin path: Quantize using Marlin's method (UINT4b8) ===
-    from vllm.model_executor.layers.quantization.utils.marlin_utils_test import (
-        marlin_quantize,
-    )
+    w1_marlin, w1_scales_marlin = marlin_quantize_moe_weights(w1_bf16, group_size)
+    w2_marlin, w2_scales_marlin = marlin_quantize_moe_weights(w2_bf16, group_size)
 
-    w1_marlin_list = []
-    w1_scales_marlin_list = []
-    w2_marlin_list = []
-    w2_scales_marlin_list = []
-
-    for i in range(e):
-        # Marlin w1: transpose [2n, k] → [k, 2n] for quantization
-        w1_t = w1_bf16[i].T.contiguous()  # [k, 2n]
-        _, w1_marlin_q, w1_marlin_s, _, _, _ = marlin_quantize(
-            w1_t, scalar_types.uint4b8, group_size, act_order=False
-        )
-        w1_marlin_list.append(w1_marlin_q)
-        w1_scales_marlin_list.append(w1_marlin_s)
-
-        # Marlin w2: transpose [k, n] → [n, k] for quantization
-        w2_t = w2_bf16[i].T.contiguous()  # [n, k]
-        _, w2_marlin_q, w2_marlin_s, _, _, _ = marlin_quantize(
-            w2_t, scalar_types.uint4b8, group_size, act_order=False
-        )
-        w2_marlin_list.append(w2_marlin_q)
-        w2_scales_marlin_list.append(w2_marlin_s)
-
-    w1_marlin = torch.stack(w1_marlin_list)  # [e, ...] Marlin format
-    w1_scales_marlin = torch.stack(w1_scales_marlin_list)  # [e, ...] Marlin format
-    w2_marlin = torch.stack(w2_marlin_list)  # [e, ...] Marlin format
-    w2_scales_marlin = torch.stack(w2_scales_marlin_list)  # [e, ...] Marlin format
-
-    # Use PyTorch reference routing (noaux_tc_ref) for Marlin path
-    # The model config (n_group=1, topk_group=1, topk=8) doesn't satisfy
-    # fused_topk_deepseek constraints (requires topk_group*n_group >= topk)
-    # So TRT-LLM must be using a different internal routing implementation
     routing_scores = noaux_tc_ref(
         routing_logits,
         routing_bias,
@@ -204,26 +239,8 @@ def test_marlin_vs_trtllm_mxint4_moe(m, n, k, e, topk):
     )
 
     # === TRT-LLM path: Quantize using MXINT4 method (signed INT4) ===
-    w1_trtllm_list = []
-    w1_trtllm_scales_list = []
-    w2_trtllm_list = []
-    w2_trtllm_scales_list = []
-
-    for i in range(e):
-        # TRT-LLM w1: Quantize [2n, k] with mxint4
-        w1_int4, w1_scales = mxint4_quantize(w1_bf16[i], group_size)
-        w1_trtllm_list.append(w1_int4)
-        w1_trtllm_scales_list.append(w1_scales)
-
-        # TRT-LLM w2: Quantize [k, n] with mxint4
-        w2_int4, w2_scales = mxint4_quantize(w2_bf16[i], group_size)
-        w2_trtllm_list.append(w2_int4)
-        w2_trtllm_scales_list.append(w2_scales)
-
-    w1_int4 = torch.stack(w1_trtllm_list)  # [e, 2n, k//2] uint8 packed
-    w1_scales = torch.stack(w1_trtllm_scales_list)  # [e, 2n, k//32]
-    w2_int4 = torch.stack(w2_trtllm_list)  # [e, k, n//2] uint8 packed
-    w2_scales = torch.stack(w2_trtllm_scales_list)  # [e, k, n//32]
+    w1_int4, w1_scales = mxint4_quantize_moe_weights(w1_bf16, group_size)
+    w2_int4, w2_scales = mxint4_quantize_moe_weights(w2_bf16, group_size)
 
     trtllm_weights = prepare_static_weights_for_trtllm_mxint4_moe(
         gemm1_weights=w1_int4,
@@ -235,20 +252,6 @@ def test_marlin_vs_trtllm_mxint4_moe(m, n, k, e, topk):
     from flashinfer import RoutingMethodType
     from flashinfer.fused_moe import trtllm_mxint4_block_scale_moe
 
-    # For FlashInfer: pass raw routing_logits (float32) and routing_bias
-    # First, compute what routing TRT-LLM should produce internally
-    print("\nDEBUG: Comparing routing - what TRT-LLM should compute internally:")
-    routing_scores_trtllm = noaux_tc_ref(
-        routing_logits,
-        routing_bias,
-        n_group,
-        topk_group,
-        topk,
-        routed_scaling,
-    )
-    topk_weights_trtllm, topk_ids_trtllm = torch.topk(
-        routing_scores_trtllm, k=topk, dim=-1, largest=True, sorted=True
-    )
     trtllm_output = trtllm_mxint4_block_scale_moe(
         routing_logits=routing_logits,
         routing_bias=routing_bias.to(torch.bfloat16),
@@ -287,7 +290,9 @@ def test_marlin_vs_trtllm_mxint4_moe(m, n, k, e, topk):
             # w2: [k, n] @ [n] -> [k]
             expert_out = intermediate @ w2_bf16[expert_id].T  # [k]
             bf16_output[token_idx] += weight * expert_out
-    # Key assertion: same INT4 weights should give similar outputs
-    # NOTE: Marlin and FlashInfer use different INT4 formats, so direct comparison
-    # may not be valid. Consider comparing each against a BF16 reference instead.
+    # Compare against BF16 reference.
+    torch.testing.assert_close(marlin_output, bf16_output, atol=0.2, rtol=0.5)
+    torch.testing.assert_close(trtllm_output, bf16_output, atol=0.2, rtol=0.5)
+
+    # Compare against each other for sanity.
     torch.testing.assert_close(marlin_output, trtllm_output, atol=0.2, rtol=0.5)
