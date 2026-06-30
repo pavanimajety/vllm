@@ -2038,7 +2038,26 @@ class FlashInferImpl(AttentionImpl):
                     f"contiguous, got strides {kv_strides}"
                 )
 
-                if output.dtype == FP4_DTYPE:
+                if num_decode_tokens % attn_metadata.num_decodes != 0:
+                    # This gets triggered when the dummy_run forces
+                    # attention to be initialized with q_len = 0
+                    q_len_per_req = 1
+                else:
+                    q_len_per_req = num_decode_tokens // attn_metadata.num_decodes
+
+                lse = None
+                if use_dcp:
+                    assert output.dtype != FP4_DTYPE, (
+                        "FP4 output quantization is not supported with DCP"
+                    )
+                    decode_query = get_dcp_group().all_gather(decode_query, dim=-2)
+                    out = torch.empty_like(decode_query)
+                    lse = torch.empty(
+                        (decode_query.size(0), decode_query.size(1)),
+                        dtype=torch.float32,
+                        device=decode_query.device,
+                    )
+                elif output.dtype == FP4_DTYPE:
                     assert self.o_sf_scale is not None
                     out = FP4Tensor(
                         data=output[:num_decode_tokens],
@@ -2052,7 +2071,9 @@ class FlashInferImpl(AttentionImpl):
 
                 # NVFP4 trtllm kernel only supports FP8 output.
                 # Use a pre-allocated FP8 buffer and dequantize afterwards.
-                needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                needs_fp8_out = (
+                    not use_dcp and self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
+                )
                 if needs_fp8_out:
                     out = self._nvfp4_fp8_out[:num_decode_tokens]
 
@@ -2093,13 +2114,21 @@ class FlashInferImpl(AttentionImpl):
                     out=out,
                     kv_layout=get_kv_cache_layout(),
                     backend=attn_metadata.decode.kernel.value,
+                    lse=lse,
+                    return_lse=use_dcp,
                     q_len_per_req=q_len_per_req,
                     kv_cache_sf=(
                         nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None
                     ),
                 )
 
-                if needs_fp8_out:
+                if use_dcp:
+                    output[:num_decode_tokens] = self.dcp_combine(
+                        out,
+                        lse,
+                        get_dcp_group(),
+                    )
+                elif needs_fp8_out:
                     output[:num_decode_tokens].copy_(out.to(output.dtype))
         return output_padded
 
