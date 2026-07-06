@@ -512,7 +512,7 @@ class FIDecode:
     wrapper: BatchDecodeWithPagedKVCacheWrapper
 
 
-class FlashInferDecodeKernel(Enum):
+class TrtllmDecodeAPIKernel(Enum):
     """Decode kernels selected inside the FlashInfer backend."""
 
     XQA = "xqa"
@@ -556,7 +556,7 @@ class FlashInferTrtllmAPIDecode:
     decode kernels because their dtype/layout/output constraints differ.
     """
 
-    kernel: FlashInferDecodeKernel
+    kernel: TrtllmDecodeAPIKernel
 
     block_tables: torch.Tensor
     """
@@ -751,14 +751,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             and self.num_qo_heads // self.num_kv_heads > 1
         ), f"Unexpected FlashInfer page size {self.page_size} without trtllm-gen GQA"
         self.use_trtllm_decode_attention = can_use_xqa_or_trtllm_gen_decode
-        self.flashinfer_trtllm_api_decode_kernel: FlashInferDecodeKernel | None = (
-            self._get_flashinfer_trtllm_api_decode_kernel()
+        self.trtllm_api_decode_kernel: TrtllmDecodeAPIKernel | None = (
+            self._get_trtllm_api_decode_kernel()
             if can_use_xqa_or_trtllm_gen_decode
             else None
         )
         if (
             self.use_dcp
-            and self.flashinfer_trtllm_api_decode_kernel == FlashInferDecodeKernel.XQA
+            and self.trtllm_api_decode_kernel == TrtllmDecodeAPIKernel.XQA
         ):
             logger.warning_once(
                 "FlashInfer XQA decode does not support returning LSE and "
@@ -766,10 +766,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                 "decode."
             )
             self.use_trtllm_decode_attention = False
-            self.flashinfer_trtllm_api_decode_kernel = None
+            self.trtllm_api_decode_kernel = None
         supports_spec_as_decode = (
-            self.flashinfer_trtllm_api_decode_kernel
-            == FlashInferDecodeKernel.TRTLLM_GEN
+            self.trtllm_api_decode_kernel == TrtllmDecodeAPIKernel.TRTLLM_GEN
         )
         self._init_reorder_batch_threshold(
             1,
@@ -815,8 +814,8 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         capability = current_platform.get_device_capability()
         arch = f"sm{capability.major}{capability.minor}" if capability else "unknown"
         decode_backend = (
-            self.flashinfer_trtllm_api_decode_kernel.value
-            if self.flashinfer_trtllm_api_decode_kernel is not None
+            self.trtllm_api_decode_kernel.value
+            if self.trtllm_api_decode_kernel is not None
             else "flashinfer-native"
         )
         logger.info_once(
@@ -962,11 +961,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         self._workspace_buffer = workspace_buffer
 
     @staticmethod
-    def _get_flashinfer_trtllm_api_decode_kernel() -> FlashInferDecodeKernel:
+    def _get_trtllm_api_decode_kernel() -> TrtllmDecodeAPIKernel:
         if current_platform.is_device_capability(90):
-            return FlashInferDecodeKernel.XQA
+            return TrtllmDecodeAPIKernel.XQA
         assert current_platform.is_device_capability_family(100)
-        return FlashInferDecodeKernel.TRTLLM_GEN
+        return TrtllmDecodeAPIKernel.TRTLLM_GEN
 
     def _get_prefill_wrapper(
         self,
@@ -1120,6 +1119,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
     ) -> FlashInferMetadata:
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
+        # causal is only false for dflash-draft model path
         causal = common_attn_metadata.causal
         if causal:
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -1167,7 +1167,9 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        decode_with_flashinfer_trtllm_api = causal and self.use_trtllm_decode_attention
+        decode_use_trtllm = (
+            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
+        )
 
         if not causal and self.use_dcp:
             raise NotImplementedError(
@@ -1180,7 +1182,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             )
         all_uses_trtllm = causal and (
             (num_prefills == 0 or prefill_use_trtllm)
-            and (num_decodes == 0 or decode_with_flashinfer_trtllm_api)
+            and (num_decodes == 0 or decode_use_trtllm)
         )
 
         if not all_uses_trtllm:
@@ -1269,9 +1271,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
         # paged_kv_indices is only needed for FlashInfer native paths;
         # XQA/trtllm-gen paths use block_tables directly on GPU.
         needs_native_paged_prefill = num_prefills > 0 and not prefill_use_trtllm
-        needs_native_paged_decode = (
-            num_decodes > 0 and not decode_with_flashinfer_trtllm_api
-        )
+        needs_native_paged_decode = num_decodes > 0 and not decode_use_trtllm
         needs_paged_kv_indices = (
             use_cascade or needs_native_paged_prefill or needs_native_paged_decode
         )
@@ -1450,20 +1450,15 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
 
         ## DECODE PATHWAY
         if num_decodes > 0:
-            if decode_with_flashinfer_trtllm_api:
+            if decode_use_trtllm:
                 assert num_decode_tokens % num_decodes == 0, (
                     "XQA/trtllm-gen decode requires uniform query lengths per request. "
                     f"Got {num_decode_tokens=} and {num_decodes=}."
                 )
-                assert self.flashinfer_trtllm_api_decode_kernel is not None
+                assert self.trtllm_api_decode_kernel is not None
                 seq_lens_decode = seq_lens[:num_decodes]
-                if self.use_dcp:
-                    assert common_attn_metadata.dcp_local_seq_lens is not None
-                    seq_lens_decode = common_attn_metadata.dcp_local_seq_lens[
-                        :num_decodes
-                    ]
                 attn_metadata.decode = FlashInferTrtllmAPIDecode(
-                    kernel=self.flashinfer_trtllm_api_decode_kernel,
+                    kernel=self.trtllm_api_decode_kernel,
                     block_tables=block_table_tensor[:num_decodes],
                     seq_lens=seq_lens_decode,
                     max_seq_len=max_seq_len,
@@ -1721,9 +1716,9 @@ class FlashInferImpl(AttentionImpl):
             if isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode)
             else None
         )
-        decode_with_xqa = decode_kernel == FlashInferDecodeKernel.XQA
-        decode_with_trtllm_gen = decode_kernel == FlashInferDecodeKernel.TRTLLM_GEN
-        decode_with_flashinfer_trtllm_api = decode_with_xqa or decode_with_trtllm_gen
+        decode_with_xqa = decode_kernel == TrtllmDecodeAPIKernel.XQA
+        decode_with_trtllm_gen = decode_kernel == TrtllmDecodeAPIKernel.TRTLLM_GEN
+        decode_use_trtllm = decode_with_xqa or decode_with_trtllm_gen
 
         # The attn+quant fusion happens when output_scale is provided.
         if output_scale is None:
@@ -1853,7 +1848,7 @@ class FlashInferImpl(AttentionImpl):
         use_dcp = self.dcp_world_size > 1
 
         # Regular attention (common case).
-        if not prefill_use_trtllm and not decode_with_flashinfer_trtllm_api:
+        if not prefill_use_trtllm and not decode_use_trtllm:
             self.forward_with_flashinfer_wrapper(
                 layer=layer,
                 query=query,
@@ -1888,7 +1883,7 @@ class FlashInferImpl(AttentionImpl):
                 prefill_use_trtllm=prefill_use_trtllm,
                 decode_with_xqa=decode_with_xqa,
                 decode_with_trtllm_gen=decode_with_trtllm_gen,
-                decode_with_flashinfer_trtllm_api=decode_with_flashinfer_trtllm_api,
+                decode_use_trtllm=decode_use_trtllm,
                 use_dcp=use_dcp,
             )
 
@@ -1966,10 +1961,10 @@ class FlashInferImpl(AttentionImpl):
         prefill_use_trtllm: bool,
         decode_with_xqa: bool,
         decode_with_trtllm_gen: bool,
-        decode_with_flashinfer_trtllm_api: bool,
+        decode_use_trtllm: bool,
         use_dcp: bool,
     ) -> None:
-        assert prefill_use_trtllm or decode_with_flashinfer_trtllm_api, (
+        assert prefill_use_trtllm or decode_use_trtllm, (
             "forward_with_trtllm_api only supports trtllm_batch* wrappers"
         )
         if use_dcp:
@@ -2008,7 +2003,7 @@ class FlashInferImpl(AttentionImpl):
                     use_dcp=use_dcp,
                 )
         if num_decode_tokens > 0:
-            if decode_with_flashinfer_trtllm_api:
+            if decode_use_trtllm:
                 self.forward_decode_trtllm(
                     layer=layer,
                     query=query,
