@@ -1975,7 +1975,14 @@ class FlashInferImpl(AttentionImpl):
                     decode_query = get_dcp_group().all_gather(
                         decode_query.contiguous(), dim=-2
                     )
-                    output_tmp = torch.empty_like(decode_query)
+                    dcp_output_dtype = (
+                        FP8_DTYPE if self.is_kvcache_nvfp4 else output.dtype
+                    )
+                    output_tmp = torch.empty(
+                        decode_query.shape,
+                        dtype=dcp_output_dtype,
+                        device=decode_query.device,
+                    )
                     lse = torch.empty(
                         (decode_query.size(0), decode_query.size(1)),
                         dtype=torch.float32,
@@ -2054,7 +2061,14 @@ class FlashInferImpl(AttentionImpl):
                         "FP4 output quantization is not supported with DCP"
                     )
                     decode_query = get_dcp_group().all_gather(decode_query, dim=-2)
-                    out = torch.empty_like(decode_query)
+                    dcp_output_dtype = (
+                        FP8_DTYPE if self.is_kvcache_nvfp4 else output.dtype
+                    )
+                    out = torch.empty(
+                        decode_query.shape,
+                        dtype=dcp_output_dtype,
+                        device=decode_query.device,
+                    )
                     lse = torch.empty(
                         (decode_query.size(0), decode_query.size(1)),
                         dtype=torch.float32,
