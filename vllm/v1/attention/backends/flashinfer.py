@@ -1112,9 +1112,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
             has_sinks=self.has_sinks,
             has_spec=uses_spec_reorder,
         )
-        decode_with_flashinfer_trtllm_api = (
-            causal and self.use_trtllm_decode_attention and self.dcp_world_size <= 1
-        )
+        decode_with_flashinfer_trtllm_api = causal and self.use_trtllm_decode_attention
 
         if not causal and self.use_dcp:
             raise NotImplementedError(
