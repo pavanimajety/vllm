@@ -246,6 +246,7 @@ class BatchDCPPrefillWrapper:
         logits_soft_cap: float | None,
         q_data_type: torch.dtype,
         kv_cache_dtype: torch.dtype,
+        o_data_type: torch.dtype,
         prefill_fixed_split_size: int,
         disable_split_kv: bool,
     ):
@@ -265,6 +266,7 @@ class BatchDCPPrefillWrapper:
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
             kv_data_type=kv_cache_dtype,
+            o_data_type=o_data_type,
             fixed_split_size=prefill_fixed_split_size,
             disable_split_kv=disable_split_kv,
         )
@@ -280,6 +282,7 @@ class BatchDCPPrefillWrapper:
             window_left=window_left,
             logits_soft_cap=logits_soft_cap,
             q_data_type=q_data_type,
+            o_data_type=o_data_type,
         )
 
     def run(
@@ -1331,6 +1334,11 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     prefill_start : num_reqs + 1
                 ]
                 assert paged_kv_indptr_prefill_cpu.shape[0] == num_prefills + 1
+                # NVFP4 trtllm kernel only supports FP8 output; otherwise
+                # keep attention output in model dtype even if prefill Q is FP8.
+                o_dtype = (
+                    FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
+                )
                 if self.use_dcp:
                     assert isinstance(prefill_wrapper, BatchDCPPrefillWrapper)
                     prefill_wrapper.plan(
@@ -1348,6 +1356,7 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                         logits_soft_cap=self.logits_soft_cap,
                         q_data_type=self.q_data_type_prefill,
                         kv_cache_dtype=self.kv_cache_dtype,
+                        o_data_type=o_dtype,
                         prefill_fixed_split_size=self.prefill_fixed_split_size,
                         disable_split_kv=self.disable_split_kv,
                     )
@@ -1355,12 +1364,6 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
                     assert isinstance(
                         prefill_wrapper,
                         BatchPrefillWithPagedKVCacheWrapper,
-                    )
-                    # NVFP4 trtllm kernel only supports FP8 output;
-                    # use FP8 o_data_type so the wrapper matches the
-                    # FP8 output buffer allocated in forward().
-                    o_dtype = (
-                        FP8_DTYPE if self.is_kvcache_nvfp4 else self.model_config.dtype
                     )
                     prefill_wrapper.plan(
                         qo_indptr=qo_indptr_prefill_cpu,
