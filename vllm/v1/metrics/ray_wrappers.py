@@ -3,6 +3,7 @@
 import copy
 import time
 
+from vllm.distributed.eplb.metrics import EplbProm
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorProm
 from vllm.v1.metrics.loggers import PrometheusStatLogger
 from vllm.v1.metrics.perf import PerfMetricsProm
@@ -200,6 +201,17 @@ class RayPerfMetricsProm(PerfMetricsProm):
     _counter_cls = RayCounterWrapper
 
 
+class RayEplbProm(EplbProm):
+    """
+    RayEplbProm is used by RayMetrics to log Ray metrics.
+    Provides the same EPLB load metrics as EplbProm but uses
+    Ray's util.metrics library.
+    """
+
+    _gauge_cls = RayGaugeWrapper
+    _counter_cls = RayCounterWrapper
+
+
 class RayPrometheusStatLogger(PrometheusStatLogger):
     """RayPrometheusStatLogger uses Ray metrics instead."""
 
@@ -209,6 +221,7 @@ class RayPrometheusStatLogger(PrometheusStatLogger):
     _spec_decoding_cls = RaySpecDecodingProm
     _kv_connector_cls = RayKVConnectorProm
     _perf_metrics_cls = RayPerfMetricsProm
+    _eplb_cls = RayEplbProm
 
     @staticmethod
     def _unregister_vllm_metrics():

@@ -49,6 +49,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.interfaces import MixtureOfExperts
 from vllm.platforms import current_platform
 from vllm.utils.gpu_sync_debug import gpu_sync_allowed
+from vllm.v1.metrics.stats import EplbMetricsStats
 
 from .async_worker import start_async_worker
 from .eplb_communicator import EplbCommunicator, create_eplb_communicator
@@ -289,6 +290,28 @@ class EplbState:
         self.cuda_device_index: int | None = None
         """
         CUDA device index for the async EPLB worker thread.
+        """
+        self.num_valid_physical_experts: int = 0
+        """
+        Number of valid physical experts.
+        This is the number of physical experts that are
+        actually mapped to logical experts. In elastic EP,
+        newly started EP ranks may not have physical experts
+        mapped yet.
+        """
+        self.last_eplb_stats: EplbMetricsStats | None = None
+        """
+        Most recent per-step logical-expert load stats for Prometheus export.
+        Computed locally (no inter-rank sync) when prometheus_expert_load
+        is enabled.
+        """
+        self.rearrangements_since_last_report: int = 0
+        """
+        Number of rearrangements since the last stats were consumed.
+        """
+        self.last_rearrangement_seconds: float = 0.0
+        """
+        Duration of the most recent rearrangement in seconds.
         """
         if self.device.type == "cuda":
             self.cuda_device_index = self.device.index
@@ -611,6 +634,11 @@ class EplbState:
                         - self.expert_rearrangement_step,
                     )
 
+        # Snapshot per-logical-expert load for Prometheus before the pass
+        # buffer is zeroed below.
+        if not is_dummy and self.parallel_config.eplb_config.prometheus_expert_load:
+            self._compute_local_expert_load_stats()
+
         # Update the expert load sliding window
         if not is_dummy:
             should_record = self._should_record_current_step(log_stats=log_stats)
@@ -658,6 +686,7 @@ class EplbState:
                 return
             self.expert_rearrangement_step = 0
             self.rearrange()
+            self.rearrangements_since_last_report += 1
 
         self._update_layer_should_record(log_stats=log_stats)
 
@@ -667,7 +696,11 @@ class EplbState:
         Recording is enabled when we are close to either:
         1) The next rearrangement step, so the sliding window is ready.
         2) The next balancedness logging step, when log_stats is enabled.
+        3) Prometheus expert-load export is enabled (every step).
         """
+        if self.parallel_config.eplb_config.prometheus_expert_load:
+            return True
+
         steps_remaining = (
             self.expert_rearrangement_step_interval - self.expert_rearrangement_step
         )
@@ -912,6 +945,7 @@ class EplbState:
                     end_event.record()
                     end_event.synchronize()
                     gpu_elapsed = start_event.elapsed_time(end_event) / 1000.0
+                    self.last_rearrangement_seconds = gpu_elapsed
                     logger.info(
                         "Rearranged experts %s in %.2f s.",
                         " (profile) " if is_profile else " ",
@@ -1043,6 +1077,69 @@ class EplbState:
         for eplb_model_state in self.model_states.values():
             load_pass_list.append(eplb_model_state.expert_load_pass.clone())
         return self._allreduce_list(load_pass_list)
+
+    @staticmethod
+    def physical_load_to_logical(
+        expert_load: torch.Tensor,
+        physical_to_logical: torch.Tensor,
+        num_logical_experts: int,
+    ) -> torch.Tensor:
+        """Sum physical-expert loads into logical-expert loads.
+
+        Args:
+            expert_load: `(num_moe_layers, num_physical_experts)` assignment
+                counts for the current step.
+            physical_to_logical: `(num_moe_layers, num_physical_experts)` map.
+            num_logical_experts: Number of logical experts per layer.
+
+        Returns:
+            `(num_moe_layers, num_logical_experts)` float tensor where replica
+            slots that share a logical expert are summed.
+        """
+        logical_load = torch.zeros(
+            expert_load.shape[0],
+            num_logical_experts,
+            dtype=torch.float32,
+            device=expert_load.device,
+        )
+        logical_load.scatter_add_(
+            dim=-1,
+            index=physical_to_logical.long(),
+            src=expert_load.float(),
+        )
+        return logical_load
+
+    def _compute_local_expert_load_stats(self) -> None:
+        """Compute per-step logical-expert counts from this rank's view.
+
+        No inter-rank communication. Each rank's ``expert_load_pass`` records
+        how many of THIS rank's tokens were routed to each physical expert.
+        Physical replica slots are mapped to logical experts and summed so
+        Prometheus labels stay stable across rearrangements.
+        """
+        if not self.model_states:
+            self.last_eplb_stats = None
+            return
+
+        # Use the first model's expert_load_pass (main model, not drafter).
+        eplb_model_state = next(iter(self.model_states.values()))
+        num_valid = self.num_valid_physical_experts
+        expert_load = eplb_model_state.expert_load_pass[:, :num_valid]
+        physical_to_logical = eplb_model_state.physical_to_logical_map[:, :num_valid]
+        logical_load = self.physical_load_to_logical(
+            expert_load,
+            physical_to_logical,
+            eplb_model_state.model.num_logical_experts,
+        )
+
+        rearrangements = self.rearrangements_since_last_report
+        self.rearrangements_since_last_report = 0
+
+        self.last_eplb_stats = EplbMetricsStats(
+            tokens_per_logical_expert=logical_load.cpu().tolist(),
+            rearrangements=rearrangements,
+            last_rearrangement_seconds=self.last_rearrangement_seconds,
+        )
 
     @classmethod
     def from_mapping(

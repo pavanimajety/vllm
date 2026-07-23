@@ -11,6 +11,7 @@ from prometheus_client import Counter, Gauge, Histogram
 import vllm.envs as envs
 from vllm.compilation.cuda_graph import CUDAGraphLogging
 from vllm.config import SupportsMetricsInfo, VllmConfig
+from vllm.distributed.eplb.metrics import EplbProm
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorLogging,
     KVConnectorProm,
@@ -447,6 +448,7 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
     _spec_decoding_cls = SpecDecodingProm
     _kv_connector_cls = KVConnectorProm
     _perf_metrics_cls = PerfMetricsProm
+    _eplb_cls = EplbProm
 
     def __init__(
         self, vllm_config: VllmConfig, engine_indexes: list[int] | None = None
@@ -485,6 +487,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
         )
         self.perf_metrics_prom = self._perf_metrics_cls(
             vllm_config, labelnames, per_engine_labelvalues
+        )
+        self.eplb_prom = self._eplb_cls(
+            vllm_config.parallel_config, labelnames, per_engine_labelvalues
         )
 
         #
@@ -1149,6 +1154,9 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
 
             if scheduler_stats.perf_stats is not None:
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
+
+            if scheduler_stats.eplb_stats is not None:
+                self.eplb_prom.observe(scheduler_stats.eplb_stats, engine_idx)
 
             if (
                 self.kv_cache_metrics_enabled

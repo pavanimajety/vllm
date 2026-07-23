@@ -21,11 +21,13 @@ if TYPE_CHECKING:
         KVConnectorWorkerMetadata,
     )
     from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+    from vllm.v1.metrics.stats import EplbMetricsStats
 else:
     KVConnectorStats = object
     KVConnectorWorkerMetadata = object
     KVConnectorKVEvents = object
     ECConnectorWorkerMetadata = object
+    EplbMetricsStats = object
 
 
 class LogprobsLists(NamedTuple):
@@ -383,6 +385,10 @@ class ModelRunnerOutput:
 
     # ``None`` when ``return_sampling_mask`` is off.
     sampling_masks: SamplingMaskLists | None = None
+
+    # Per-step EPLB logical-expert load stats for Prometheus.
+    # ``None`` when EPLB is disabled or prometheus_expert_load is off.
+    eplb_stats: "EplbMetricsStats | None" = None
 
     @staticmethod
     def with_kv_conn_output_only(
