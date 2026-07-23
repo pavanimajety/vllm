@@ -4763,6 +4763,10 @@ class GPUModelRunner(
         kv_connector_output = self.kv_connector_output
         self.kv_connector_output = None
 
+        eplb_stats = (
+            self.eplb_state.last_eplb_stats if self.eplb_state is not None else None
+        )
+
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             output = ModelRunnerOutput(
                 req_ids=req_ids_output_copy,
@@ -4777,6 +4781,7 @@ class GPUModelRunner(
                 num_nans_in_logits=num_nans_in_logits,
                 cudagraph_stats=cudagraph_stats,
                 routed_experts=None,
+                eplb_stats=eplb_stats,
             )
 
         if not self.use_async_scheduling:

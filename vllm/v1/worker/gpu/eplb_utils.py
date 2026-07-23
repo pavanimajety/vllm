@@ -41,6 +41,18 @@ def step_eplb_after(*, is_dummy: bool = False) -> Callable:
 
             is_profile = kwargs.get("is_profile", False) if is_dummy else False
             self.eplb.step(is_dummy=is_dummy, is_profile=is_profile)
+
+            # Attach Prometheus stats after stepping so they reflect this
+            # forward's expert_load_pass. V2 steps EPLB after constructing
+            # ModelRunnerOutput / AsyncOutput.
+            stats = (
+                self.eplb.state.last_eplb_stats if self.eplb.state is not None else None
+            )
+            if result is not None:
+                if hasattr(result, "eplb_stats"):
+                    result.eplb_stats = stats
+                elif hasattr(result, "model_runner_output"):
+                    result.model_runner_output.eplb_stats = stats
             return result
 
         return wrapper

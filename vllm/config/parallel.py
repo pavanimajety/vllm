@@ -81,6 +81,14 @@ class EPLBConfig:
     """
     Interval for logging the balancedness.
     """
+    prometheus_expert_load: bool = False
+    """
+    Export per-step per-logical-expert routing counts to Prometheus.
+
+    Off by default due to high cardinality (``num_moe_layers ×
+    num_logical_experts`` time series). When enabled, expert-load
+    recording runs every engine step so gauges reflect the current step.
+    """
     use_async: bool = True
     """
     Whether to use non-blocking EPLB.

@@ -183,6 +183,28 @@ class SchedulerIterationDetails:
 
 
 @dataclass
+class EplbMetricsStats:
+    """EPLB load stats computed per step for Prometheus export.
+
+    Each engine reports how many of its tokens were routed to each logical
+    expert, per MoE layer, for the current engine step. Replica slots that
+    map to the same logical expert are summed. These gauges are directly
+    summable across DP ranks in Prometheus/Grafana without inter-rank
+    synchronization:
+
+        sum by (layer_idx, logical_expert_id) (
+            vllm:eplb_tokens_routed_to_expert
+        )
+    """
+
+    # tokens_per_logical_expert[layer][logical_expert] = assignment count
+    # Shape semantics: (num_moe_layers, num_logical_experts)
+    tokens_per_logical_expert: list[list[float]]
+    rearrangements: int = 0
+    last_rearrangement_seconds: float = 0.0
+
+
+@dataclass
 class SchedulerStats:
     """Stats associated with the scheduler."""
 
@@ -212,6 +234,8 @@ class SchedulerStats:
     cudagraph_stats: CUDAGraphStat | None = None
 
     perf_stats: PerfStats | None = None
+
+    eplb_stats: EplbMetricsStats | None = None
 
 
 @dataclass
