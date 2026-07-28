@@ -31,11 +31,11 @@ if not current_platform.is_device_capability_family(100):
         allow_module_level=True,
     )
 
-from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
-    FlashInferImpl,
-    FlashInferMetadataBuilder,
-    FlashInferTrtllmAPIDecode,
+from vllm.v1.attention.backends.trtllm import (  # noqa: E402
+    TRTLLMDecode,
     TrtllmDecodeAPIKernel,
+    TRTLLMImpl,
+    TRTLLMMetadataBuilder,
     TRTLLMPrefill,
 )
 
@@ -423,7 +423,7 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                 _mock_get_per_layer_parameters,
             ),
         ):
-            builder = FlashInferMetadataBuilder(
+            builder = TRTLLMMetadataBuilder(
                 kv_cache_spec, layer_names, vllm_config, device
             )
             attn_metadata = builder.build(
@@ -440,13 +440,12 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                     f"Expected TRTLLMPrefill, got {type(attn_metadata.prefill)}"
                 )
             if has_decodes:
-                assert isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode), (
-                    "Expected FlashInferTrtllmAPIDecode, got "
-                    f"{type(attn_metadata.decode)}"
+                assert isinstance(attn_metadata.decode, TRTLLMDecode), (
+                    f"Expected TRTLLMDecode, got {type(attn_metadata.decode)}"
                 )
                 assert attn_metadata.decode.kernel == TrtllmDecodeAPIKernel.TRTLLM_GEN
 
-            impl = FlashInferImpl(
+            impl = TRTLLMImpl(
                 num_heads=num_q_heads,
                 head_size=head_size,
                 scale=scale,

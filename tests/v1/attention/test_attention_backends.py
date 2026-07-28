@@ -745,7 +745,6 @@ def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
     import unittest.mock
 
     from vllm.utils.flashinfer import can_use_trtllm_attention
-    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
     from vllm.v1.attention.backends.utils import PerLayerParameters
 
     def mock_get_per_layer_parameters(vllm_config, layer_names, impl_cls):
@@ -797,7 +796,9 @@ def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
             "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
             mock_get_per_layer_parameters,
         ):
-            builder = flashinfer_backend.FlashInferMetadataBuilder(
+            from vllm.v1.attention.backends import trtllm as attn_backend
+
+            builder = attn_backend.TRTLLMMetadataBuilder(
                 kv_cache_spec, ["placeholder"], vllm_config, device
             )
             common_attn_metadata = create_common_attn_metadata(
@@ -806,21 +807,21 @@ def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
             attn_metadata = builder.build(0, common_attn_metadata)
 
     assert (
-        flashinfer_backend.FlashInferMetadataBuilder.get_cudagraph_support(
+        attn_backend.TRTLLMMetadataBuilder.get_cudagraph_support(
             vllm_config, kv_cache_spec
         )
         == AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
     assert isinstance(
         attn_metadata.decode,
-        flashinfer_backend.FlashInferTrtllmAPIDecode,
+        attn_backend.TRTLLMDecode,
     )
-    assert attn_metadata.decode.kernel == flashinfer_backend.TrtllmDecodeAPIKernel.XQA
+    assert attn_metadata.decode.kernel == attn_backend.TrtllmDecodeAPIKernel.XQA
 
     _test_backend_correctness(
         batch_spec,
         "meta-llama/Meta-Llama-3-8B",
-        [AttentionBackendEnum.FLASHINFER],
+        [AttentionBackendEnum.TRTLLM],
         causal_mask_mod,
     )
 
