@@ -61,6 +61,23 @@ except ImportError:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
 
 
+def _is_hopper_or_blackwell() -> bool:
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability(90)
+        or current_platform.is_device_capability_family(100)
+    )
+
+
+if AttentionBackendEnum.FLASHINFER in BACKENDS_TO_TEST and _is_hopper_or_blackwell():
+    BACKENDS_TO_TEST.append(AttentionBackendEnum.TRTLLM)
+
+
+def _trtllm_batch_supported(batch_spec: BatchSpec) -> bool:
+    if current_platform.is_device_capability_family(100):
+        return True
+    return all(query_len == 1 for query_len in batch_spec.query_lens)
+
+
 def _convert_dtype_to_torch(dtype):
     """Convert ModelDType to torch.dtype."""
     if isinstance(dtype, str):
@@ -263,8 +280,11 @@ def run_attention_backend(
 
     builder_cls, impl_cls = try_get_attention_backend(actual_backend)
 
-    # Mock flashinfer's get_per_layer_parameters if needed
-    if actual_backend == AttentionBackendEnum.FLASHINFER:
+    # Mock layer hyperparameters for FlashInfer-family backends.
+    if actual_backend in (
+        AttentionBackendEnum.FLASHINFER,
+        AttentionBackendEnum.TRTLLM,
+    ):
         import unittest.mock
 
         from vllm.v1.attention.backends.utils import PerLayerParameters
@@ -281,8 +301,13 @@ def run_attention_backend(
                 for layer_name in layer_names
             }
 
+        patch_target = (
+            "vllm.v1.attention.backends.trtllm.get_per_layer_parameters"
+            if actual_backend == AttentionBackendEnum.TRTLLM
+            else "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters"
+        )
         with unittest.mock.patch(
-            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            patch_target,
             mock_get_per_layer_parameters,
         ):
             builder = builder_cls(kv_cache_spec, layer_names, vllm_config, device)
@@ -540,7 +565,17 @@ def _test_backend_correctness(
         ):
             continue
 
-        if backend_name == AttentionBackendEnum.FLASHINFER:
+        if backend_name == AttentionBackendEnum.TRTLLM and (
+            attn_type != AttentionType.DECODER
+            or causal is not True
+            or not _trtllm_batch_supported(batch_spec)
+        ):
+            continue
+
+        if backend_name in (
+            AttentionBackendEnum.FLASHINFER,
+            AttentionBackendEnum.TRTLLM,
+        ):
             set_kv_cache_layout("HND")
             reset_kv_cache_layout = True
 
@@ -734,13 +769,13 @@ def test_flashinfer_attention_sinks_refreshed_after_reload(dtype):
 
 
 @pytest.mark.skipif(
-    AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
-    reason="FlashInfer is not available.",
+    AttentionBackendEnum.TRTLLM not in BACKENDS_TO_TEST,
+    reason="TRTLLM attention is not available.",
 )
-def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
-    """FlashInfer should route Hopper decode through XQA and match SDPA."""
+def test_trtllm_sm90_xqa_decode_correctness(default_vllm_config):
+    """TRTLLM should route Hopper decode through XQA and match SDPA."""
     if not current_platform.is_cuda() or not current_platform.is_device_capability(90):
-        pytest.skip("FlashInfer XQA decode requires SM90.")
+        pytest.skip("TRTLLM XQA decode requires SM90.")
 
     import unittest.mock
 
@@ -790,10 +825,10 @@ def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
             kv_cache_spec.num_kv_heads,
             is_prefill=False,
         ):
-            pytest.skip("FlashInfer XQA decode is not available in this setup.")
+            pytest.skip("TRTLLM XQA decode is not available in this setup.")
 
         with unittest.mock.patch(
-            "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+            "vllm.v1.attention.backends.trtllm.get_per_layer_parameters",
             mock_get_per_layer_parameters,
         ):
             from vllm.v1.attention.backends import trtllm as attn_backend
@@ -823,6 +858,39 @@ def test_flashinfer_sm90_xqa_decode_correctness(default_vllm_config):
         "meta-llama/Meta-Llama-3-8B",
         [AttentionBackendEnum.TRTLLM],
         causal_mask_mod,
+    )
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-oss-20b", "meta-llama/Meta-Llama-3-8B"])
+@pytest.mark.parametrize(
+    "backend",
+    [AttentionBackendEnum.FLASHINFER, AttentionBackendEnum.TRTLLM],
+)
+def test_flashinfer_trtllm_decode_model_coverage(
+    default_vllm_config,
+    model: str,
+    backend: AttentionBackendEnum,
+):
+    """Cover GPT-OSS and Llama decode on both split FlashInfer backends."""
+    if backend not in BACKENDS_TO_TEST:
+        pytest.skip(f"{backend} is not available in this environment.")
+
+    def causal_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return (q_idx + context_len) >= kv_idx
+
+    _test_backend_correctness(
+        BATCH_SPECS["small_decode"],
+        model,
+        [backend],
+        causal_mask_mod,
+        tensor_parallel_size=4,
     )
 
 

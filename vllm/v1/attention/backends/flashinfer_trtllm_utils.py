@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Shared helpers for FlashInfer wrapper and TRTLLM attention backends."""
 
+from dataclasses import dataclass
+from enum import Enum
+
 import torch
 
 from vllm import _custom_ops as custom_ops
@@ -15,6 +18,92 @@ FP8_DTYPE = current_platform.fp8_dtype()
 FP4_DTYPE = torch.uint8
 
 _trtllm_workspace_buffer: torch.Tensor | None = None
+
+
+class TrtllmDecodeAPIKernel(Enum):
+    """Decode kernels selected inside the TRTLLM backend."""
+
+    XQA = "xqa"
+    TRTLLM_GEN = "trtllm-gen"
+
+
+@dataclass
+class TRTLLMPrefill:
+    """Metadata for the TRTLLM prefill pathway."""
+
+    block_tables: torch.Tensor
+    """
+    The slice of the block table tensor corresponding *only* to prefill requests.
+    Shape: [num_prefills, max_num_blocks_per_seq]
+    """
+
+    seq_lens: torch.Tensor
+    """
+    The slice of the sequence lengths tensor corresponding *only* to prefill requests.
+    Shape: [num_prefills]
+    """
+
+    cum_seq_lens_q: torch.Tensor
+    cum_seq_lens_kv: torch.Tensor
+
+    max_q_len: int
+    """
+    The maximum query length *among prefill requests*.
+    """
+
+    max_seq_len: int
+    """The maximum sequence length for KV Cache."""
+
+
+@dataclass
+class TRTLLMDecode:
+    """Metadata for decode paths using FlashInfer's TRTLLM decode API.
+
+    FlashInfer exposes both XQA (SM90) and trtllm-gen (SM100) through
+    ``trtllm_batch_decode_with_kv_cache``. Keep them as distinct vLLM
+    decode kernels because their dtype/layout/output constraints differ.
+    """
+
+    kernel: TrtllmDecodeAPIKernel
+
+    block_tables: torch.Tensor
+    """
+    The slice of the block table tensor corresponding *only* to decode requests.
+    Shape: [num_decodes, max_num_blocks_per_seq]
+    """
+
+    seq_lens: torch.Tensor
+    """
+    The slice of the sequence lengths tensor corresponding *only* to decode requests.
+    Shape: [num_decodes]
+    """
+
+    max_seq_len: int
+    """The maximum sequence length for KV Cache."""
+
+
+@dataclass
+class TRTLLMMetadata:
+    num_actual_tokens: int
+    """Total number of tokens in the batch (excluding padding)."""
+
+    slot_mapping: torch.Tensor
+    """Tensor for writing K/V to the cache. Shape: [num_actual_tokens]"""
+
+    q_data_type_prefill: torch.dtype
+    q_data_type_decode: torch.dtype
+
+    num_decodes: int
+    num_decode_tokens: int
+    num_prefills: int
+    num_prefill_tokens: int
+    causal: bool
+
+    prefill: TRTLLMPrefill | None
+    """Direct TRTLLM API metadata for the prefill slice."""
+
+    decode: TRTLLMDecode | None
+    """Direct TRTLLM API metadata for the decode slice."""
 
 
 def get_trtllm_workspace_buffer() -> torch.Tensor:
