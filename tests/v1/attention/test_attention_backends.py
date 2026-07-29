@@ -799,15 +799,15 @@ def test_causal_backend_correctness(
     AttentionBackendEnum.FLASHINFER not in BACKENDS_TO_TEST,
     reason="FlashInfer is not available.",
 )
-def test_flashinfer_xqa_bmm1_scale_matches_decode_q_dtype():
+def test_trtllm_xqa_bmm1_scale_matches_decode_q_dtype():
     """XQA decode should only apply q_scale when decode Q is FP8."""
-    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+    from vllm.v1.attention.backends import trtllm as trtllm_backend
 
     class MockLayer:
         _q_scale_float = 2.0
         _k_scale_float = 3.0
 
-    impl = object.__new__(flashinfer_backend.FlashInferImpl)
+    impl = object.__new__(trtllm_backend.TRTLLMImpl)
     impl.scale = 0.5
     impl.kv_cache_dtype = "fp8"
 
@@ -900,11 +900,11 @@ def test_flashinfer_xqa_query_lens_require_exact_uniform_product():
     reason="FlashInfer is not available.",
 )
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_flashinfer_attention_sinks_refreshed_after_reload(dtype):
-    from vllm.v1.attention.backends import flashinfer as flashinfer_backend
+def test_trtllm_attention_sinks_refreshed_after_reload(dtype):
+    from vllm.v1.attention.backends import trtllm as trtllm_backend
 
     source_sinks = torch.tensor([1.0, 2.0], dtype=dtype)
-    impl = object.__new__(flashinfer_backend.FlashInferImpl)
+    impl = object.__new__(trtllm_backend.TRTLLMImpl)
     impl._sinks_source = source_sinks
     impl.sinks = source_sinks
 
