@@ -114,7 +114,7 @@ def test_trtllm_kvfp8_dequant(
     num_pages_per_seq: int,
     layout: KVCacheLayout,
 ):
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -163,7 +163,7 @@ def test_trtllm_kvfp8_dequant(
 @torch.inference_mode()
 def test_block_tables_with_zero_pages():
     """Pages with index <= 0 must be skipped (early return in kernel)."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -210,7 +210,7 @@ def test_block_tables_with_zero_pages():
 @torch.inference_mode()
 def test_all_zero_block_tables():
     """All-zero block_tables: kernel should write nothing."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -242,7 +242,7 @@ def test_all_zero_block_tables():
 @torch.inference_mode()
 def test_different_k_v_scales():
     """Verify K and V are dequantized with independent scales."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -275,7 +275,7 @@ def test_different_k_v_scales():
 @torch.inference_mode()
 def test_single_page_per_seq():
     """Minimum grid dim 1 = 1 page per sequence."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -307,7 +307,7 @@ def test_single_page_per_seq():
 @torch.inference_mode()
 def test_large_page_indices():
     """Page indices near the top of the buffer stress offset arithmetic."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -345,7 +345,7 @@ def test_large_page_indices():
 @torch.inference_mode()
 def test_large_block_size():
     """block_size=64 -> HEAD_STRIDE=8192, large tl.arange per thread block."""
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
@@ -386,7 +386,7 @@ def test_cross_layer_many_layers():
     Non-contiguous with 36 layers -- matches real gpt-oss-120b.
     Cross-layer (BLHNC) strides are far from contiguous (factor of 36 in the gaps).
     """
-    from vllm.v1.attention.backends.flashinfer import (
+    from vllm.v1.attention.backends.trtllm import (
         trtllm_prefill_attn_kvfp8_dequant,
     )
 
