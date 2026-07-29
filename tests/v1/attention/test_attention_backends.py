@@ -16,7 +16,7 @@ from tests.v1.attention.utils import (
     try_backend_includes_kv_cache_update,
     try_get_attention_backend,
 )
-from vllm.config import ModelConfig, set_current_vllm_config
+from vllm.config import ModelConfig
 from vllm.platforms import current_platform
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import (
@@ -66,6 +66,17 @@ try:
     import flashinfer  # noqa: F401
 except ImportError:
     BACKENDS_TO_TEST.remove(AttentionBackendEnum.FLASHINFER)
+
+
+def _trtllm_backend_available() -> bool:
+    """TRTLLM serves both prefill and decode only on SM100/SM103."""
+    return current_platform.is_cuda() and current_platform.is_device_capability_family(
+        100
+    )
+
+
+if AttentionBackendEnum.FLASHINFER in BACKENDS_TO_TEST and _trtllm_backend_available():
+    BACKENDS_TO_TEST.append(AttentionBackendEnum.TRTLLM)
 
 
 def _convert_dtype_to_torch(dtype):
@@ -608,6 +619,11 @@ def _test_backend_correctness(
         ):
             continue
 
+        if backend_name == AttentionBackendEnum.TRTLLM and (
+            attn_type != AttentionType.DECODER or causal is not True
+        ):
+            continue
+
         kv_cache_for_backend = kv_cache
         backend_layout = layout
 
@@ -1038,6 +1054,39 @@ def test_flashinfer_xqa_decode_correctness(default_vllm_config):
         "meta-llama/Meta-Llama-3-8B",
         [AttentionBackendEnum.FLASHINFER],
         causal_mask_mod,
+    )
+
+
+@pytest.mark.parametrize("model", ["openai/gpt-oss-20b", "meta-llama/Meta-Llama-3-8B"])
+@pytest.mark.parametrize(
+    "backend",
+    [AttentionBackendEnum.FLASHINFER, AttentionBackendEnum.TRTLLM],
+)
+def test_flashinfer_trtllm_decode_model_coverage(
+    default_vllm_config,
+    model: str,
+    backend: AttentionBackendEnum,
+):
+    """Cover GPT-OSS and Llama decode on both split FlashInfer backends."""
+    if backend not in BACKENDS_TO_TEST:
+        pytest.skip(f"{backend} is not available in this environment.")
+
+    def causal_mask_mod(
+        b: torch.Tensor,
+        h: torch.Tensor,
+        q_idx: torch.Tensor,
+        kv_idx: torch.Tensor,
+        *,
+        context_len: int,
+    ):
+        return (q_idx + context_len) >= kv_idx
+
+    _test_backend_correctness(
+        BATCH_SPECS["small_decode"],
+        model,
+        [backend],
+        causal_mask_mod,
+        tensor_parallel_size=4,
     )
 
 
