@@ -63,6 +63,7 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RouterTopKBitmapDumper,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -7733,6 +7734,14 @@ class GPUModelRunner(
         )
         self.routed_experts_initialized = True
 
+    def init_router_topk_bitmap_dumper(self, output_dir: str) -> None:
+        logger.info("Initializing router top-k bitmap dumper: %s", output_dir)
+        dumper = RouterTopKBitmapDumper(
+            output_dir=output_dir,
+            vllm_config=self.vllm_config,
+        )
+        self._bind_router_topk_bitmap_dumper(dumper)
+
     def _bind_routed_experts_capturer(self, capturer: RoutedExpertsCapturer) -> None:
         from vllm.model_executor.layers.fused_moe.layer import MoERunner
         from vllm.model_executor.layers.fused_moe.modular_kernel import (
@@ -7767,6 +7776,34 @@ class GPUModelRunner(
                 fused_experts.set_capture_fn(_capture_fn)
             elif isinstance(module.router, BaseRouter):
                 module.router.set_capture_fn(_capture_fn)
+
+    def _bind_router_topk_bitmap_dumper(self, dumper: RouterTopKBitmapDumper) -> None:
+        from vllm.model_executor.layers.fused_moe.layer import MoERunner
+        from vllm.model_executor.layers.fused_moe.router.base_router import (
+            BaseRouter,
+        )
+
+        for module in self.model.modules():
+            if not isinstance(module, MoERunner):
+                continue
+            if not isinstance(module.router, BaseRouter):
+                continue
+            layer_id = module.layer_id
+            num_logical_experts = module.moe_config.num_logical_experts
+            previous_capture_fn = module.router.capture_fn
+
+            def _capture_fn(
+                topk_ids,
+                _layer_id=layer_id,
+                _dumper=dumper,
+                _num_logical_experts=num_logical_experts,
+                _previous_capture_fn=previous_capture_fn,
+            ):
+                if _previous_capture_fn is not None:
+                    _previous_capture_fn(topk_ids)
+                _dumper.capture(_layer_id, topk_ids, _num_logical_experts)
+
+            module.router.set_capture_fn(_capture_fn)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

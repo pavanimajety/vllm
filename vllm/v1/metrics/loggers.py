@@ -1156,7 +1156,11 @@ class PrometheusStatLogger(AggregateStatLoggerBase):
                 self.perf_metrics_prom.observe(scheduler_stats.perf_stats, engine_idx)
 
             if scheduler_stats.eplb_stats is not None:
-                self.eplb_prom.observe(scheduler_stats.eplb_stats, engine_idx)
+                self.eplb_prom.observe(
+                    scheduler_stats.eplb_stats,
+                    engine_idx,
+                    scheduler_stats.step_counter,
+                )
 
             if (
                 self.kv_cache_metrics_enabled

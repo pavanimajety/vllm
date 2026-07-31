@@ -5,7 +5,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import struct
+import threading
+from collections import defaultdict
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -17,6 +23,18 @@ from vllm.platforms import current_platform
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_int_env(*names: str) -> int | None:
+    for name in names:
+        value = os.environ.get(name)
+        if value is None or value == "":
+            continue
+        try:
+            return int(value)
+        except ValueError:
+            return None
+    return None
 
 
 def _get_num_experts_per_tok(hf_config) -> int:
@@ -228,6 +246,150 @@ class RoutedExpertsCapturer:
         :meth:`clear_buffer`.
         """
         return self.device_buffer
+
+
+class RouterTopKBitmapDumper:
+    """Append router top-k decisions as per-token expert bitmaps.
+
+    This diagnostic dumper is intentionally independent of EPLB. It records
+    logical expert IDs immediately after router top-k selection and before any
+    EPLB remapping. Each worker writes rank-specific files to avoid multi-rank
+    append races on shared filesystems.
+    """
+
+    def __init__(self, output_dir: str, vllm_config: VllmConfig) -> None:
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.dp_rank = vllm_config.parallel_config.data_parallel_rank
+        self.tp_size = vllm_config.parallel_config.tensor_parallel_size
+        self.rank = _resolve_int_env("RANK", "SLURM_PROCID") or 0
+        self.local_rank = _resolve_int_env("LOCAL_RANK", "SLURM_LOCALID")
+        self._lock = threading.Lock()
+        self._step_by_layer: dict[int, int] = defaultdict(int)
+        logger.info(
+            "RouterTopKBitmapDumper: writing router top-k bitmaps to %s "
+            "(rank=%d, local_rank=%s)",
+            self.output_dir,
+            self.rank,
+            self.local_rank,
+        )
+
+    def _slice_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        ctx = get_forward_context()
+        if ctx.dp_metadata is None:
+            return topk_ids
+
+        num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
+        token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
+        total = int(num_tokens_dp.sum().item())
+        n = topk_ids.shape[0]
+
+        if n == total:
+            cumsum = torch.cumsum(num_tokens_dp, dim=0)
+            end_loc = int(cumsum[self.dp_rank].item())
+            start_loc = end_loc - token_num_per_dp
+            return topk_ids[start_loc:end_loc, :]
+        if n == token_num_per_dp:
+            return topk_ids
+        if (
+            self.tp_size > 1
+            and n != token_num_per_dp
+            and n == (token_num_per_dp + self.tp_size - 1) // self.tp_size
+        ):
+            return get_tp_group().all_gather(topk_ids, dim=0)[:token_num_per_dp, :]
+
+        sp_expected = (
+            (token_num_per_dp + self.tp_size - 1) // self.tp_size
+            if self.tp_size > 0
+            else -1
+        )
+        raise AssertionError(
+            "RouterTopKBitmapDumper: unexpected topk_ids batch dim "
+            f"{n} (expected {total}, {token_num_per_dp}, or {sp_expected} "
+            f"for dp_rank={self.dp_rank}, tp_size={self.tp_size})"
+        )
+
+    @staticmethod
+    def _encode_bitmap_bytes(
+        topk_ids_cpu: torch.Tensor,
+        num_logical_experts: int,
+    ) -> bytes:
+        words_per_token = (num_logical_experts + 63) // 64
+        payload = bytearray(topk_ids_cpu.shape[0] * words_per_token * 8)
+        offset = 0
+        for row in topk_ids_cpu.tolist():
+            words = [0] * words_per_token
+            for expert_id in row:
+                expert = int(expert_id)
+                if expert < 0 or expert >= num_logical_experts:
+                    raise ValueError(
+                        "RouterTopKBitmapDumper: expert id "
+                        f"{expert} outside [0, {num_logical_experts})"
+                    )
+                words[expert // 64] |= 1 << (expert % 64)
+            for word in words:
+                struct.pack_into("<Q", payload, offset, word)
+                offset += 8
+        return bytes(payload)
+
+    @staticmethod
+    def _counts(
+        topk_ids_cpu: torch.Tensor, num_logical_experts: int
+    ) -> list[list[int]]:
+        flat = topk_ids_cpu.reshape(-1)
+        if flat.numel() == 0:
+            return []
+        counts = torch.bincount(flat, minlength=num_logical_experts)
+        nz = torch.nonzero(counts, as_tuple=False).flatten().tolist()
+        return [[int(i), int(counts[i].item())] for i in nz]
+
+    def capture(
+        self,
+        layer_id: int,
+        topk_ids: torch.Tensor,
+        num_logical_experts: int,
+    ) -> None:
+        if topk_ids.is_cuda and torch.cuda.is_current_stream_capturing():
+            return
+
+        sliced = self._slice_topk_ids(topk_ids)
+        topk_ids_cpu = sliced.detach().to("cpu", dtype=torch.int64)
+        num_tokens = int(topk_ids_cpu.shape[0])
+        top_k = int(topk_ids_cpu.shape[1]) if topk_ids_cpu.ndim == 2 else 0
+        words_per_token = (num_logical_experts + 63) // 64
+        payload = self._encode_bitmap_bytes(topk_ids_cpu, num_logical_experts)
+        counts = self._counts(topk_ids_cpu, num_logical_experts)
+
+        base = f"layer_{layer_id:03d}.rank_{self.rank:03d}"
+        bitmap_path = self.output_dir / f"{base}.token_expert_bitmap.u64"
+        jsonl_path = self.output_dir / f"{base}.jsonl"
+
+        with self._lock:
+            step = self._step_by_layer[layer_id]
+            self._step_by_layer[layer_id] += 1
+            offset_bytes = bitmap_path.stat().st_size if bitmap_path.exists() else 0
+            with bitmap_path.open("ab") as f:
+                f.write(payload)
+            record = {
+                "schema": "router_topk_bitmap_v1",
+                "rank": self.rank,
+                "local_rank": self.local_rank,
+                "step": step,
+                "layer": layer_id,
+                "num_logical_experts": num_logical_experts,
+                "num_tokens": num_tokens,
+                "top_k": top_k,
+                "counts": counts,
+                "token_expert_bitmap": {
+                    "path": bitmap_path.name,
+                    "offset_bytes": offset_bytes,
+                    "num_tokens": num_tokens,
+                    "words_per_token": words_per_token,
+                    "dtype": "uint64_le",
+                },
+            }
+            with jsonl_path.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
 class RoutedExpertsManager:
