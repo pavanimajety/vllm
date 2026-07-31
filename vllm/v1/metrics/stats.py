@@ -200,6 +200,11 @@ class EplbMetricsStats:
     # tokens_per_logical_expert[layer][logical_expert] = assignment count
     # Shape semantics: (num_moe_layers, num_logical_experts)
     tokens_per_logical_expert: list[list[float]]
+    # token_expert_bitmaps[layer] stores raw little-endian uint64 bitmaps,
+    # one bitmap per routed token. Word i covers logical experts
+    # [64*i, 64*i + 63]. This is optional because it is much larger than
+    # the aggregated per-expert counts.
+    token_expert_bitmaps: list[bytes | None] | None = None
     rearrangements: int = 0
     last_rearrangement_seconds: float = 0.0
 

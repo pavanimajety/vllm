@@ -3,6 +3,11 @@
 
 from __future__ import annotations
 
+import json
+import math
+import os
+import threading
+
 import prometheus_client
 
 from vllm.config import ParallelConfig
@@ -89,6 +94,18 @@ class EplbProm:
             tuple[int, int, int],
             prometheus_client.Gauge,
         ] = {}
+        self._step_metrics_dir = os.environ.get("VLLM_EPLB_STEP_METRICS_DIR")
+        step_metrics_path = os.environ.get("VLLM_EPLB_STEP_METRICS_PATH")
+        if self._step_metrics_dir is None and step_metrics_path is not None:
+            if step_metrics_path.endswith(".jsonl"):
+                self._step_metrics_dir = os.path.splitext(step_metrics_path)[0]
+            else:
+                self._step_metrics_dir = step_metrics_path
+        self._step_metrics_lock = threading.Lock()
+        self._step_metrics_counters: dict[int, int] = {}
+        self._step_metrics_fds: dict[int, int] = {}
+        self._token_bitmap_fds: dict[int, int] = {}
+        self._token_bitmap_offsets: dict[int, int] = {}
 
     def _get_tokens_child(
         self, engine_idx: int, layer_idx: int, logical_expert_id: int
@@ -103,7 +120,113 @@ class EplbProm:
             self._tokens_children[key] = child
         return child
 
-    def observe(self, eplb_stats: EplbMetricsStats, engine_idx: int = 0):
+    @staticmethod
+    def _integer_count(count: float) -> int:
+        count_float = float(count)
+        if not count_float.is_integer():
+            raise ValueError(f"EPLB routed-token count is not integral: {count}")
+        return int(count_float)
+
+    @staticmethod
+    def _write_all(fd: int, data: bytes) -> None:
+        view = memoryview(data)
+        while view:
+            written = os.write(fd, view)
+            view = view[written:]
+
+    def _append_step_metrics(
+        self,
+        eplb_stats: EplbMetricsStats,
+        engine_idx: int,
+        step_counter: int | None,
+    ) -> None:
+        if self._step_metrics_dir is None:
+            return
+
+        with self._step_metrics_lock:
+            previous_step = self._step_metrics_counters.get(engine_idx)
+            if previous_step is None:
+                output_step = 0 if step_counter is None else step_counter
+            elif step_counter is None or step_counter <= previous_step:
+                output_step = previous_step + 1
+            else:
+                output_step = step_counter
+            self._step_metrics_counters[engine_idx] = output_step
+
+        os.makedirs(self._step_metrics_dir, exist_ok=True)
+        num_logical_experts = (
+            len(eplb_stats.tokens_per_logical_expert[0])
+            if eplb_stats.tokens_per_logical_expert
+            else 0
+        )
+        words_per_token = math.ceil(num_logical_experts / 64)
+        with self._step_metrics_lock:
+            for layer_idx, expert_counts in enumerate(
+                eplb_stats.tokens_per_logical_expert
+            ):
+                nonzero_counts: list[list[int]] = []
+                for logical_expert_id, count in enumerate(expert_counts):
+                    int_count = self._integer_count(count)
+                    if int_count:
+                        nonzero_counts.append([logical_expert_id, int_count])
+                record = {
+                    "engine": engine_idx,
+                    "step": output_step,
+                    "layer": layer_idx,
+                    "num_logical_experts": num_logical_experts,
+                    "counts": nonzero_counts,
+                }
+                if eplb_stats.token_expert_bitmaps is not None:
+                    bitmap = eplb_stats.token_expert_bitmaps[layer_idx]
+                    if bitmap is not None:
+                        bytes_per_token = words_per_token * 8
+                        if bytes_per_token == 0 or len(bitmap) % bytes_per_token:
+                            raise ValueError(
+                                "EPLB token-expert bitmap bytes are not aligned: "
+                                f"layer={layer_idx}, bytes={len(bitmap)}, "
+                                f"bytes_per_token={bytes_per_token}"
+                            )
+                        bitmap_fd = self._token_bitmap_fds.get(layer_idx)
+                        if bitmap_fd is None:
+                            bitmap_fd = os.open(
+                                os.path.join(
+                                    self._step_metrics_dir,
+                                    (f"layer_{layer_idx:03d}.token_expert_bitmap.u64"),
+                                ),
+                                os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                                0o644,
+                            )
+                            self._token_bitmap_fds[layer_idx] = bitmap_fd
+                            self._token_bitmap_offsets[layer_idx] = 0
+                        offset = self._token_bitmap_offsets[layer_idx]
+                        self._write_all(bitmap_fd, bitmap)
+                        self._token_bitmap_offsets[layer_idx] = offset + len(bitmap)
+                        record["token_expert_bitmap"] = {
+                            "path": f"layer_{layer_idx:03d}.token_expert_bitmap.u64",
+                            "offset_bytes": offset,
+                            "num_tokens": len(bitmap) // bytes_per_token,
+                            "words_per_token": words_per_token,
+                            "dtype": "uint64_le",
+                        }
+                line = json.dumps(record, separators=(",", ":")).encode("utf-8") + b"\n"
+                fd = self._step_metrics_fds.get(layer_idx)
+                if fd is None:
+                    fd = os.open(
+                        os.path.join(
+                            self._step_metrics_dir, f"layer_{layer_idx:03d}.jsonl"
+                        ),
+                        os.O_WRONLY | os.O_CREAT | os.O_APPEND,
+                        0o644,
+                    )
+                    self._step_metrics_fds[layer_idx] = fd
+                self._write_all(fd, line)
+
+    def observe(
+        self,
+        eplb_stats: EplbMetricsStats,
+        engine_idx: int = 0,
+        step_counter: int | None = None,
+    ):
         if not self.enabled:
             return
 
@@ -112,6 +235,8 @@ class EplbProm:
                 self._get_tokens_child(engine_idx, layer_idx, logical_expert_id).set(
                     count
                 )
+
+        self._append_step_metrics(eplb_stats, engine_idx, step_counter)
 
         if eplb_stats.rearrangements > 0:
             self.counter_rearrangements[engine_idx].inc(eplb_stats.rearrangements)

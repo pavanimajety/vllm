@@ -26,11 +26,13 @@ MoE layer. If we have 32 EP ranks, then each GPU will hold 288 / 32 = 9 local
 physical experts.
 """
 
+import os
 import threading
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+import numpy as np
 import torch
 from torch.distributed import ProcessGroup, all_reduce
 
@@ -313,6 +315,12 @@ class EplbState:
         """
         Duration of the most recent rearrangement in seconds.
         """
+        self.record_token_expert_mapping = (
+            os.environ.get("VLLM_EPLB_STEP_TOKEN_MAPPING") == "1"
+        )
+        """
+        Opt-in capture of per-token logical expert sets for step JSONL sidecars.
+        """
         if self.device.type == "cuda":
             self.cuda_device_index = self.device.index
             if self.cuda_device_index is None and torch.cuda.is_available():
@@ -548,6 +556,14 @@ class EplbState:
                 val = max(0, min(num_unpadded_tokens, ts.stop) - ts.start)
                 tensors[i].fill_(val)
 
+    @staticmethod
+    def _clear_token_expert_id_batches(eplb_model_state: EplbModelState) -> None:
+        for layer in eplb_model_state.model.moe_layers:
+            layer_state = getattr(layer, "eplb_state", None)
+            batches = getattr(layer_state, "token_expert_id_batches", None)
+            if batches is not None:
+                batches.clear()
+
     def step(
         self,
         is_dummy: bool = False,
@@ -582,6 +598,7 @@ class EplbState:
             # Do not record load metrics for dummy steps
             for eplb_model_state in self.model_states.values():
                 eplb_model_state.expert_load_pass.zero_()
+                self._clear_token_expert_id_batches(eplb_model_state)
 
         if (
             log_stats
@@ -754,6 +771,7 @@ class EplbState:
             if ls is not None:
                 ls.should_record_tensor = self.should_record_tensor
                 ls.num_unpadded_tokens_tensors = num_unpadded_tokens_tensors
+                ls.record_token_expert_mapping = self.record_token_expert_mapping
 
     def rearrange(
         self,
@@ -1109,6 +1127,32 @@ class EplbState:
         )
         return logical_load
 
+    @staticmethod
+    def logical_expert_ids_to_bitmap_bytes(
+        token_expert_ids: torch.Tensor,
+        num_logical_experts: int,
+    ) -> bytes:
+        """Pack token->logical-expert ids as uint64 bitmaps.
+
+        Output layout is raw little-endian uint64[token][word], where each word
+        covers 64 logical experts. The mapping keeps expert membership only;
+        top-k order is intentionally not represented.
+        """
+        words_per_token = (num_logical_experts + 63) // 64
+        if token_expert_ids.numel() == 0:
+            return b""
+
+        ids = token_expert_ids.detach().cpu().numpy().astype(np.int64, copy=False)
+        valid = (ids >= 0) & (ids < num_logical_experts)
+        rows, cols = np.nonzero(valid)
+        bitmaps = np.zeros((ids.shape[0], words_per_token), dtype="<u8")
+        experts = ids[rows, cols]
+        word_indices = experts // 64
+        bit_indices = (experts % 64).astype(np.uint64, copy=False)
+        bits = np.left_shift(np.uint64(1), bit_indices)
+        np.bitwise_or.at(bitmaps, (rows, word_indices), bits)
+        return bitmaps.tobytes()
+
     def _compute_local_expert_load_stats(self) -> None:
         """Compute per-step logical-expert counts from this rank's view.
 
@@ -1131,12 +1175,30 @@ class EplbState:
             physical_to_logical,
             eplb_model_state.model.num_logical_experts,
         )
+        token_expert_bitmaps: list[bytes | None] | None = None
+        if self.record_token_expert_mapping:
+            token_expert_bitmaps = []
+            for layer in eplb_model_state.model.moe_layers:
+                layer_state = getattr(layer, "eplb_state", None)
+                batches = getattr(layer_state, "token_expert_id_batches", None)
+                if not batches:
+                    token_expert_bitmaps.append(None)
+                    continue
+                token_expert_ids = torch.cat(batches, dim=0)
+                token_expert_bitmaps.append(
+                    self.logical_expert_ids_to_bitmap_bytes(
+                        token_expert_ids,
+                        eplb_model_state.model.num_logical_experts,
+                    )
+                )
+            self._clear_token_expert_id_batches(eplb_model_state)
 
         rearrangements = self.rearrangements_since_last_report
         self.rearrangements_since_last_report = 0
 
         self.last_eplb_stats = EplbMetricsStats(
             tokens_per_logical_expert=logical_load.cpu().tolist(),
+            token_expert_bitmaps=token_expert_bitmaps,
             rearrangements=rearrangements,
             last_rearrangement_seconds=self.last_rearrangement_seconds,
         )
@@ -1237,6 +1299,8 @@ class EplbLayerState:
     Reference to the parent :class:`EplbModelState`'s tensor list so the
     router can read the correct per-[u]batch unpadded token count.
     """
+    record_token_expert_mapping: bool = False
+    token_expert_id_batches: list[torch.Tensor] = field(default_factory=list)
 
     def set_layer_state(
         self,

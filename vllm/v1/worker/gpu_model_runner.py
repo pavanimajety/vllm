@@ -64,7 +64,9 @@ from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RouterTopKBitmapDumper,
     bind_routed_experts_capturer,
+    bind_router_topk_bitmap_dumper,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateCopyFuncsByType
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
@@ -7600,6 +7602,18 @@ class GPUModelRunner(
             device=self.device,
         )
         self.routed_experts_initialized = True
+
+    def init_router_topk_bitmap_dumper(self, output_dir: str) -> None:
+        logger.info("Initializing router top-k bitmap dumper: %s", output_dir)
+        dumper = RouterTopKBitmapDumper(
+            output_dir=output_dir,
+            vllm_config=self.vllm_config,
+        )
+        self.router_topk_bitmap_dumper = dumper
+        self._bind_router_topk_bitmap_dumper(dumper)
+
+    def _bind_router_topk_bitmap_dumper(self, dumper: RouterTopKBitmapDumper) -> None:
+        bind_router_topk_bitmap_dumper(self.model, dumper)
 
     def may_add_encoder_only_layers_to_kv_cache_config(self) -> None:
         """

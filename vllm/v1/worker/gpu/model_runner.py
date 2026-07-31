@@ -41,7 +41,9 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
+    RouterTopKBitmapDumper,
     bind_routed_experts_capturer,
+    bind_router_topk_bitmap_dumper,
 )
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
@@ -680,6 +682,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.kv_connector = NO_OP_KV_CONNECTOR
         else:
             self.kv_connector = get_kv_connector(self.vllm_config, kv_caches_dict)
+
+    def init_router_topk_bitmap_dumper(self, output_dir: str) -> None:
+        logger.info("Initializing router top-k bitmap dumper: %s", output_dir)
+        dumper = RouterTopKBitmapDumper(
+            output_dir=output_dir,
+            vllm_config=self.vllm_config,
+        )
+        self._bind_router_topk_bitmap_dumper(dumper)
+
+    def _bind_router_topk_bitmap_dumper(self, dumper: RouterTopKBitmapDumper) -> None:
+        bind_router_topk_bitmap_dumper(self.model, dumper)
 
     def _init_kv_zero_meta(self) -> None:
         """Build KV-block zeroing metadata; invoked from gpu_worker."""

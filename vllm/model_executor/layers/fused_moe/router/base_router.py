@@ -295,6 +295,15 @@ class BaseRouter(FusedMoERouter):
         # Capture logical ids before EPLB mapping.
         if self.capture_fn is not None:
             self.capture_fn(topk_ids)
+        if self.eplb_state is not None and self.eplb_state.record_token_expert_mapping:
+            eplb_state = self.eplb_state
+            assert eplb_state.num_unpadded_tokens_tensors is not None
+            num_unpadded_tokens = int(
+                eplb_state.num_unpadded_tokens_tensors[dbo_current_ubatch_id()].item()
+            )
+            eplb_state.token_expert_id_batches.append(
+                topk_ids[:num_unpadded_tokens].detach().to("cpu", dtype=torch.int64)
+            )
 
         # Step 3: Apply EPLB mapping
         topk_ids = self._apply_eplb_mapping(topk_ids)

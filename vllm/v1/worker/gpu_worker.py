@@ -735,6 +735,10 @@ class Worker(WorkerBase):
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
 
+        router_topk_bitmap_dir = os.environ.get("VLLM_ROUTER_TOPK_BITMAP_DIR")
+        if router_topk_bitmap_dir:
+            self.model_runner.init_router_topk_bitmap_dumper(router_topk_bitmap_dir)
+
         # Build KV-zero metadata outside the CuMem pool so the bookkeeping
         # GPU tensors (seg_addrs, block-id buffers) use the standard PyTorch
         # allocator and are not discarded during sleep/wake cycles.
