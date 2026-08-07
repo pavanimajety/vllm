@@ -114,6 +114,8 @@ def _fake_vllm_config(
     """Minimal stand-in exposing only what the backends' gates read."""
     parallel_config = SimpleNamespace(
         decode_context_parallel_size=decode_context_parallel_size,
+        dcp_kv_cache_interleave_size=1,
+        dcp_comm_backend="all_gather",
     )
     return SimpleNamespace(
         parallel_config=parallel_config,
@@ -219,21 +221,29 @@ def test_flashinfer_rejects_outside_its_range(capability):
     assert "compute capability not supported" in reasons
 
 
-def test_dcp_rejects_trtllm_and_leaves_flashinfer(trtllm_kernels_available):
-    """DCP is the fall-through case: TRTLLM refuses, FlashInfer takes it.
-
-    TRTLLM prefill attends only the DCP-local KV shard and its decode cannot
-    return LSE, so neither slice can be combined across ranks. Because TRTLLM
-    leads the SM103 priority list, this rejection is what routes a DCP run to
-    FlashInfer instead of failing.
-    """
+def test_dcp_rejects_blackwell_trtllm_and_accepts_flashinfer(
+    trtllm_kernels_available,
+):
+    """Direct TRTLLM DCP needs an SM100 suffix-prefill LSE path first."""
     flashinfer_cls, trtllm_cls = _backends()
     config = _fake_vllm_config(decode_context_parallel_size=2)
     with set_current_vllm_config(config):
-        assert "decode context parallelism not supported" in _reasons(
-            trtllm_cls, capability=SM103
-        )
+        assert (
+            "TRTLLM DCP prefill for SM100 requires an LSE-producing "
+            "SM100 new-token prefill path; FMHA-v2 only generates "
+            "SM90/SM120 kernels"
+        ) in _reasons(trtllm_cls, capability=SM103)
         assert _reasons(flashinfer_cls, capability=SM103) == []
+
+
+def test_dcp_trtllm_rejects_attention_sinks(trtllm_kernels_available):
+    """The split DCP path must not double-count sink logits."""
+    _, trtllm_cls = _backends()
+    config = _fake_vllm_config(decode_context_parallel_size=2)
+    with set_current_vllm_config(config):
+        assert "TRTLLM DCP with attention sinks is not supported" in _reasons(
+            trtllm_cls, capability=SM103, has_sink=True
+        )
 
 
 def test_trtllm_rejects_unservable_head_ratio(monkeypatch):
