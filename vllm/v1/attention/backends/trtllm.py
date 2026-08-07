@@ -90,29 +90,22 @@ def _head_ratio_supported(num_qo_heads: int, num_kv_heads: int) -> bool:
     return num_kv_heads > 0 and num_qo_heads % num_kv_heads == 0
 
 
-def _is_supported_for_config(
-    num_qo_heads: int,
-    num_kv_heads: int,
-    *,
-    is_prefill: bool,
-) -> bool:
-    return _trtllm_kernel_available(is_prefill=is_prefill) and _head_ratio_supported(
-        num_qo_heads, num_kv_heads
-    )
-
-
 def is_prefill_supported_for_config(
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    return _is_supported_for_config(num_qo_heads, num_kv_heads, is_prefill=True)
+    return _trtllm_kernel_available(is_prefill=True) and _head_ratio_supported(
+        num_qo_heads, num_kv_heads
+    )
 
 
 def is_decode_supported_for_config(
     num_qo_heads: int,
     num_kv_heads: int,
 ) -> bool:
-    return _is_supported_for_config(num_qo_heads, num_kv_heads, is_prefill=False)
+    return _trtllm_kernel_available(is_prefill=False) and _head_ratio_supported(
+        num_qo_heads, num_kv_heads
+    )
 
 
 class TRTLLMBackend(AttentionBackend):
@@ -207,8 +200,8 @@ class TRTLLMBackend(AttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if has_sink:
-            return "TRTLLM attention sinks are not supported"
+        if has_sink and head_size != 64:
+            return "TRTLLM attention sinks require head_size == 64"
 
         vllm_config = get_current_vllm_config_or_none()
         if (
@@ -250,7 +243,7 @@ class TRTLLMBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        return False
+        return True
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:

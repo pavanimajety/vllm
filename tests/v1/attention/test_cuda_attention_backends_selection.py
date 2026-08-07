@@ -243,13 +243,27 @@ def test_dcp_rejects_blackwell_trtllm_and_accepts_flashinfer(
         assert _reasons(flashinfer_cls, capability=SM103) == []
 
 
-def test_trtllm_rejects_attention_sinks(trtllm_kernels_available):
-    """Sinks stay disabled until TRTLLM sink semantics are validated."""
+def test_trtllm_accepts_gpt_oss_attention_sinks(trtllm_kernels_available):
+    """TRTLLM accepts the GPT-OSS sink shape."""
     _, trtllm_cls = _backends()
-    config = _fake_vllm_config(decode_context_parallel_size=2)
+    config = _fake_vllm_config()
     with set_current_vllm_config(config):
-        assert "TRTLLM attention sinks are not supported" in _reasons(
-            trtllm_cls, capability=SM103, has_sink=True
+        assert trtllm_cls.supports_sink() is True
+        assert (
+            _reasons(trtllm_cls, capability=SM103, has_sink=True, head_size=64)
+            == []
+        )
+
+
+def test_trtllm_rejects_attention_sinks_for_non_gpt_oss_head_size(
+    trtllm_kernels_available,
+):
+    """Do not advertise sink support beyond the validated GPT-OSS shape."""
+    _, trtllm_cls = _backends()
+    config = _fake_vllm_config()
+    with set_current_vllm_config(config):
+        assert "TRTLLM attention sinks require head_size == 64" in _reasons(
+            trtllm_cls, capability=SM103, has_sink=True, head_size=128
         )
 
 
