@@ -14,7 +14,6 @@ from flashinfer.utils import FP4Tensor
 from vllm import envs
 from vllm.config import VllmConfig, get_current_vllm_config_or_none
 from vllm.config.cache import CacheDType
-from vllm.distributed.parallel_state import get_dcp_group
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8StaticTensorSym,
@@ -22,13 +21,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.platforms.interface import DeviceCapability
-from vllm.triton_utils import tl, triton
-from vllm.utils.flashinfer import (
-    can_use_trtllm_attention,
-    force_use_trtllm_attention,
-    supports_trtllm_attention,
-    use_trtllm_attention,
-)
+from vllm.utils.flashinfer import has_nvidia_artifactory
 from vllm.utils.torch_utils import (
     canonicalize_singleton_dim_strides,
     is_quantized_kv_cache,
@@ -50,26 +43,20 @@ from vllm.v1.attention.backends.flashinfer_trtllm_utils import (
     get_kv_cache_stride_order,
     maybe_quant_query,
     reshape_and_cache_flashinfer,
+    trtllm_prefill_attn_kvfp8_dequant,
 )
 from vllm.v1.attention.backends.utils import (
     KVCacheLayoutType,
-    get_dcp_local_seq_lens,
     get_kv_cache_layout,
     get_num_attention_heads_from_layers,
     get_per_layer_parameters,
     infer_global_hyperparameters,
     split_decodes_and_prefills,
 )
-from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
-from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVQuantMode,
     UniformTypeKVCacheSpecs,
-)
-from vllm.v1.worker.cp_utils import (
-    should_skip_dcp_context_attention,
-    split_dcp_context_queries,
 )
 
 FP8_DTYPE = current_platform.fp8_dtype()
@@ -89,122 +76,36 @@ def get_trtllm_workspace_buffer() -> torch.Tensor:
     return _trtllm_workspace_buffer
 
 
-@triton.jit
-def _trtllm_prefill_attn_kvfp8_dequant(
-    kv_cache_ptr,
-    block_tables_prefill_ptr,
-    block_table_stride,
-    mock_kv_cache_ptr,
-    k_scale_ptr,
-    v_scale_ptr,
-    src_stride_page,
-    src_stride_kv,
-    src_stride_head,
-    src_stride_block,
-    src_stride_head_size,
-    DST_K_CACHE_STRIDE: tl.constexpr,
-    DST_KV_CACHE_STRIDE: tl.constexpr,
-    HEAD_STRIDE: tl.constexpr,
-    HEAD_SIZE: tl.constexpr,
-    NUM_KV_HEADS: tl.constexpr,
-):
-    batch_idx = tl.program_id(0).to(tl.int64)
-    mock_block_table_idx = tl.program_id(1).to(tl.int64)
-    orig_page_num = tl.load(
-        block_tables_prefill_ptr + batch_idx * block_table_stride + mock_block_table_idx
-    ).to(tl.int64)
-    if orig_page_num <= 0:
-        return
-    dequant_dtype = mock_kv_cache_ptr.dtype.element_ty
-
-    k_scale_val = tl.load(k_scale_ptr)
-    v_scale_val = tl.load(v_scale_ptr)
-
-    mock_page_idx = batch_idx * block_table_stride + mock_block_table_idx + 1
-    logical_offsets = tl.arange(0, HEAD_STRIDE)
-    block_offsets = logical_offsets // HEAD_SIZE
-    head_size_offsets = logical_offsets % HEAD_SIZE
-
-    for h in range(NUM_KV_HEADS):
-        h_off = tl.cast(h, tl.int64)
-
-        src_k = (
-            orig_page_num * src_stride_page
-            + h_off * src_stride_head
-            + block_offsets * src_stride_block
-            + head_size_offsets * src_stride_head_size
-        )
-        fp8_k = tl.load(kv_cache_ptr + src_k)
-        dequant_k = (fp8_k.to(tl.float32) * k_scale_val).to(dequant_dtype)
-
-        dst_k = mock_page_idx * DST_KV_CACHE_STRIDE + h * HEAD_STRIDE + logical_offsets
-        tl.store(mock_kv_cache_ptr + dst_k, dequant_k)
-
-        src_v = (
-            orig_page_num * src_stride_page
-            + src_stride_kv
-            + h_off * src_stride_head
-            + block_offsets * src_stride_block
-            + head_size_offsets * src_stride_head_size
-        )
-        fp8_v = tl.load(kv_cache_ptr + src_v)
-        dequant_v = (fp8_v.to(tl.float32) * v_scale_val).to(dequant_dtype)
-
-        dst_v = (
-            mock_page_idx * DST_KV_CACHE_STRIDE
-            + DST_K_CACHE_STRIDE
-            + h * HEAD_STRIDE
-            + logical_offsets
-        )
-        tl.store(mock_kv_cache_ptr + dst_v, dequant_v)
+def _trtllm_kernel_available(is_prefill: bool) -> bool:
+    if envs.VLLM_BATCH_INVARIANT:
+        return False
+    if not has_nvidia_artifactory():
+        return False
+    if current_platform.is_device_capability(90):
+        return not is_prefill
+    return current_platform.is_device_capability_family(100)
 
 
-def trtllm_prefill_attn_kvfp8_dequant(
-    kv_cache: torch.Tensor,
-    block_tables_prefill: torch.Tensor,
-    k_scale: torch.Tensor,
-    v_scale: torch.Tensor,
-    dequant_dtype: torch.dtype,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    batch_size, num_of_page_per_token = block_tables_prefill.shape
-    s = kv_cache.shape
-    assert s[1] == 2
-    assert dequant_dtype in (torch.bfloat16, torch.float16)
+def _head_ratio_supported(num_qo_heads: int, num_kv_heads: int) -> bool:
+    return num_kv_heads > 0 and num_qo_heads % num_kv_heads == 0
 
-    strides = kv_cache.stride()
-    num_kv_heads, block_size, head_size = s[2], s[3], s[4]
-    head_stride = block_size * head_size
-    k_cache_stride = num_kv_heads * head_stride
-    kv_cache_stride = k_cache_stride * s[1]
 
-    new_s = (batch_size * num_of_page_per_token + 1, s[1], s[2], s[3], s[4])
-    mock_kv_cache = torch.empty(new_s, dtype=dequant_dtype, device=kv_cache.device)
-    mock_block_table = torch.arange(
-        start=1,
-        end=batch_size * num_of_page_per_token + 1,
-        dtype=torch.int32,
-        device=block_tables_prefill.device,
-    ).reshape(batch_size, num_of_page_per_token)
-    grid = (batch_size, num_of_page_per_token)
-    _trtllm_prefill_attn_kvfp8_dequant[grid](
-        kv_cache,
-        block_tables_prefill,
-        num_of_page_per_token,
-        mock_kv_cache,
-        k_scale,
-        v_scale,
-        strides[0],
-        strides[1],
-        strides[2],
-        strides[3],
-        strides[4],
-        k_cache_stride,
-        kv_cache_stride,
-        head_stride,
-        head_size,
-        num_kv_heads,
+def is_prefill_supported_for_config(
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    return _trtllm_kernel_available(is_prefill=True) and _head_ratio_supported(
+        num_qo_heads, num_kv_heads
     )
-    return mock_kv_cache, mock_block_table
+
+
+def is_decode_supported_for_config(
+    num_qo_heads: int,
+    num_kv_heads: int,
+) -> bool:
+    return _trtllm_kernel_available(is_prefill=False) and _head_ratio_supported(
+        num_qo_heads, num_kv_heads
+    )
 
 
 class TRTLLMBackend(AttentionBackend):
@@ -269,7 +170,7 @@ class TRTLLMBackend(AttentionBackend):
             num_kv_heads > 0
             and num_qo_heads // num_kv_heads > 1
             and current_platform.is_device_capability_family(100)
-            and can_use_trtllm_attention(num_qo_heads, num_kv_heads)
+            and is_decode_supported_for_config(num_qo_heads, num_kv_heads)
         ):
             return [16, 32, 64, 128, 256, 512, 1024]
         return [16, 32, 64]
@@ -284,43 +185,7 @@ class TRTLLMBackend(AttentionBackend):
 
     @classmethod
     def supports_compute_capability(cls, capability: DeviceCapability) -> bool:
-        # trtllm-gen serves both prefill and decode only on SM100/SM103. SM90
-        # has the XQA decode kernel but no TRTLLM prefill kernel, so a batch
-        # containing any prefill could not be served; keep Hopper and older on
-        # the FlashInfer wrapper backend instead.
-        return capability.major == 10
-
-    @classmethod
-    def _prefill_uses_trtllm(
-        cls,
-        kv_cache_dtype: CacheDType | None,
-        block_size: int | None,
-        has_sink: bool,
-        vllm_config: VllmConfig,
-    ) -> bool:
-        """Mirror `use_trtllm_attention`'s prefill decision at selection time.
-
-        `TRTLLMMetadataBuilder.build` has no fallback, so a configuration whose
-        prefill slice would not take the TRTLLM path must be rejected here
-        rather than raising once traffic arrives.
-        """
-        # Matches the precedence in `TRTLLMMetadataBuilder.build`: pages >= 128
-        # are only served by the trtllm-gen dynamic kernel, so they force the
-        # TRTLLM path regardless of the CLI flag.
-        if block_size is not None and block_size >= 128:
-            return True
-        force = vllm_config.attention_config.use_trtllm_attention
-        if force is not None:
-            return force
-        if has_sink:
-            return True
-        # An unquantized KV cache reaches the builder as "auto", which
-        # auto-selects the TRTLLM prefill kernel.
-        if kv_cache_dtype is None or not is_quantized_kv_cache(kv_cache_dtype):
-            return True
-        # With a quantized KV cache the prefill kernel is auto-selected only
-        # when the query is quantized to FP8 alongside it.
-        return not vllm_config.attention_config.disable_flashinfer_q_quantization
+        return capability.major in (9, 10)
 
     @classmethod
     def supports_combination(
@@ -335,47 +200,30 @@ class TRTLLMBackend(AttentionBackend):
         use_mm_prefix: bool,
         device_capability: DeviceCapability,
     ) -> str | None:
-        if not (
-            supports_trtllm_attention(is_prefill=True)
-            and supports_trtllm_attention(is_prefill=False)
-        ):
-            return "TRTLLM prefill and decode kernels are not both available"
+        if has_sink:
+            return "TRTLLM attention sinks are not supported"
 
         vllm_config = get_current_vllm_config_or_none()
-        if vllm_config is None:
-            return None
+        if (
+            vllm_config is not None
+            and vllm_config.parallel_config.decode_context_parallel_size > 1
+        ):
+            return "TRTLLM decode context parallelism is not supported"
 
-        model_config = vllm_config.model_config
+        if not _trtllm_kernel_available(is_prefill=True):
+            return "TRTLLM prefill kernel is not available on this platform"
+        if not _trtllm_kernel_available(is_prefill=False):
+            return "TRTLLM decode kernel is not available on this platform"
+
+        model_config = vllm_config.model_config if vllm_config is not None else None
         if model_config is not None:
             parallel_config = vllm_config.parallel_config
+            num_qo_heads = model_config.get_num_attention_heads(parallel_config)
             num_kv_heads = model_config.get_num_kv_heads(parallel_config)
-            if num_kv_heads > 0 and not can_use_trtllm_attention(
-                model_config.get_num_attention_heads(parallel_config),
-                num_kv_heads,
-                is_prefill=False,
-            ):
+            if not is_prefill_supported_for_config(num_qo_heads, num_kv_heads):
+                return "TRTLLM prefill does not support this query/KV head ratio"
+            if not is_decode_supported_for_config(num_qo_heads, num_kv_heads):
                 return "TRTLLM decode does not support this query/KV head ratio"
-
-        if not cls._prefill_uses_trtllm(
-            kv_cache_dtype, block_size, has_sink, vllm_config
-        ):
-            return (
-                "TRTLLM prefill is not selected for kv_cache_dtype="
-                f"{kv_cache_dtype} with the current query quantization settings"
-            )
-
-        if vllm_config.parallel_config.decode_context_parallel_size > 1 and has_sink:
-            return "TRTLLM DCP with attention sinks is not supported"
-
-        if (
-            vllm_config.parallel_config.decode_context_parallel_size > 1
-            and device_capability.major == 10
-        ):
-            return (
-                "TRTLLM DCP prefill for SM100 requires an LSE-producing "
-                "SM100 new-token prefill path; FMHA-v2 only generates "
-                "SM90/SM120 kernels"
-            )
 
         return None
 
@@ -384,8 +232,8 @@ class TRTLLMBackend(AttentionBackend):
         if kv_cache_dtype == "nvfp4":
             return (
                 current_platform.is_device_capability_family(100)
-                and supports_trtllm_attention(is_prefill=True)
-                and supports_trtllm_attention(is_prefill=False)
+                and _trtllm_kernel_available(is_prefill=True)
+                and _trtllm_kernel_available(is_prefill=False)
             )
         return super().supports_kv_cache_dtype(kv_cache_dtype)
 
@@ -395,17 +243,7 @@ class TRTLLMBackend(AttentionBackend):
 
     @classmethod
     def supports_sink(cls) -> bool:
-        # Respect explicit disable flag (e.g.,
-        # --attention-config.use_trtllm_attention=0).
-        if force_use_trtllm_attention() is False:
-            return False
-
-        if not current_platform.is_device_capability_family(100):
-            return False
-
-        return supports_trtllm_attention(
-            is_prefill=False
-        ) and supports_trtllm_attention(is_prefill=True)
+        return False
 
     @classmethod
     def get_required_kv_cache_layout(cls) -> KVCacheLayoutType | None:
@@ -502,13 +340,6 @@ class TRTLLMMetadata:
     decode: TRTLLMDecode | None
     """Direct TRTLLM API metadata for the decode slice."""
 
-    max_dcp_context_kv_len: int | None = None
-    dcp_context_kv_lens: torch.Tensor | None = None
-    num_dcp_decode_reqs: int = 0
-    num_dcp_context_prefill_reqs: int = 0
-    num_dcp_decode_tokens: int = 0
-    num_dcp_context_prefill_tokens: int = 0
-
 
 class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
     reorder_batch_threshold: int = 1
@@ -524,17 +355,6 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         self.cache_config = vllm_config.cache_config
         self.model_config = vllm_config.model_config
         self.attention_config = vllm_config.attention_config
-
-        try:
-            self.dcp_world_size = get_dcp_group().world_size
-            self.dcp_rank = get_dcp_group().rank_in_group
-            self.dcp_kv_cache_interleave_size = (
-                vllm_config.parallel_config.dcp_kv_cache_interleave_size
-            )
-        except AssertionError:
-            self.dcp_world_size = 1
-            self.dcp_rank = 0
-            self.dcp_kv_cache_interleave_size = 1
 
         self.num_qo_heads = get_num_attention_heads_from_layers(
             vllm_config, layer_names
@@ -564,8 +384,8 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         self.q_data_type_prefill = self.get_q_data_type(is_prefill=True)
         self.q_data_type_decode = self.get_q_data_type(is_prefill=False)
 
-        can_use_decode = can_use_trtllm_attention(
-            self.num_qo_heads, self.num_kv_heads, is_prefill=False
+        can_use_decode = is_decode_supported_for_config(
+            self.num_qo_heads, self.num_kv_heads
         )
         assert self.page_size <= 64 or (
             current_platform.is_device_capability_family(100)
@@ -595,15 +415,12 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         self.has_sinks = self.global_hyperparameters.has_sinks
         if self.has_sinks and not TRTLLMBackend.supports_sink():
             raise NotImplementedError(
-                "TRTLLM attention sinks require the Blackwell trtllm-gen path."
+                "TRTLLM attention sinks are not supported."
             )
 
         max_num_reqs = vllm_config.scheduler_config.max_num_seqs
         self.paged_kv_indptr_gpu = torch.empty(
             max_num_reqs + 1, dtype=torch.int32, device=device
-        )
-        self.dcp_context_kv_lens = torch.zeros(
-            max_num_reqs, dtype=torch.int32, device=device
         )
 
     def get_q_data_type(self, is_prefill: bool) -> torch.dtype:
@@ -614,7 +431,6 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         if (
             current_platform.is_device_capability(90)
             and not is_prefill
-            and force_use_trtllm_attention() is not False
             and cache_dtype.startswith("fp8")
         ):
             return self.model_config.dtype
@@ -659,10 +475,9 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         for spec in kv_specs:
             if not isinstance(spec, AttentionSpec):
                 continue
-            if not can_use_trtllm_attention(
+            if not is_decode_supported_for_config(
                 num_qo_heads=num_qo_heads,
                 num_kv_heads=spec.num_kv_heads,
-                is_prefill=False,
             ):
                 return AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
@@ -700,24 +515,8 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
         qo_indptr = common_attn_metadata.query_start_loc
         qo_indptr_cpu = common_attn_metadata.query_start_loc_cpu
 
-        uses_spec_reorder = self.reorder_batch_threshold > 1
-        prefill_force_trtllm = (
-            True
-            if self.page_size >= 128
-            else self.attention_config.use_trtllm_attention
-        )
-        prefill_use_trtllm = use_trtllm_attention(
-            self.num_qo_heads,
-            self.num_kv_heads,
-            num_prefill_tokens,
-            max_seq_len,
-            self.dcp_world_size,
-            self.cache_dtype,
-            self.q_data_type_prefill,
-            is_prefill=True,
-            force_use_trtllm=prefill_force_trtllm,
-            has_sinks=self.has_sinks,
-            has_spec=uses_spec_reorder,
+        prefill_use_trtllm = is_prefill_supported_for_config(
+            self.num_qo_heads, self.num_kv_heads
         )
         decode_use_trtllm = self.use_trtllm_decode_attention
         all_uses_trtllm = (num_prefills == 0 or prefill_use_trtllm) and (
@@ -742,62 +541,6 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
             prefill=None,
             decode=None,
         )
-
-        if self.dcp_world_size > 1:
-            query_lens = qo_indptr[1:] - qo_indptr[:-1]
-            context_kv_lens = seq_lens - query_lens
-            local_context_kv_lens = get_dcp_local_seq_lens(
-                context_kv_lens,
-                self.dcp_world_size,
-                self.dcp_rank,
-                self.dcp_kv_cache_interleave_size,
-            )
-            self.dcp_context_kv_lens[: common_attn_metadata.num_reqs] = (
-                local_context_kv_lens
-            )
-            self.dcp_context_kv_lens[common_attn_metadata.num_reqs :] = 0
-            attn_metadata.dcp_context_kv_lens = self.dcp_context_kv_lens[
-                : common_attn_metadata.num_reqs
-            ]
-
-            skip_dcp_context_attention = False
-            if common_attn_metadata.seq_lens_cpu_upper_bound is not None:
-                query_lens_cpu = (
-                    qo_indptr_cpu[1 : common_attn_metadata.num_reqs + 1]
-                    - qo_indptr_cpu[: common_attn_metadata.num_reqs]
-                )
-                context_kv_lens_cpu = (
-                    common_attn_metadata.seq_lens_cpu_upper_bound[
-                        : common_attn_metadata.num_reqs
-                    ]
-                    - query_lens_cpu
-                )
-                skip_dcp_context_attention = should_skip_dcp_context_attention(
-                    context_kv_lens_cpu
-                )
-
-            if skip_dcp_context_attention:
-                attn_metadata.max_dcp_context_kv_len = 0
-            else:
-                num_partitions = (
-                    self.dcp_world_size * self.dcp_kv_cache_interleave_size
-                )
-                attn_metadata.max_dcp_context_kv_len = (
-                    (max_seq_len + num_partitions - 1) // num_partitions
-                ) * self.dcp_kv_cache_interleave_size
-
-            if common_attn_metadata.max_query_len > 1:
-                (
-                    attn_metadata.num_dcp_decode_reqs,
-                    attn_metadata.num_dcp_context_prefill_reqs,
-                    attn_metadata.num_dcp_decode_tokens,
-                    attn_metadata.num_dcp_context_prefill_tokens,
-                ) = split_dcp_context_queries(
-                    qo_indptr_cpu,
-                    common_attn_metadata.seq_lens_cpu_upper_bound,
-                    common_attn_metadata.max_query_len,
-                    num_actual_tokens,
-                )
 
         if num_prefills > 0:
             prefill_start = num_decodes
@@ -849,9 +592,8 @@ class TRTLLMMetadataBuilder(AttentionMetadataBuilder[TRTLLMMetadata]):
 class TRTLLMImpl(AttentionImpl):
     """Implementation for the public TRTLLM attention backend."""
 
-    can_return_lse_for_decode: bool = True
-    lse_base_on_e: bool = False
-    supports_dcp: bool = True
+    can_return_lse_for_decode: bool = False
+    supports_dcp: bool = False
 
     def __init__(
         self,
@@ -906,8 +648,8 @@ class TRTLLMImpl(AttentionImpl):
                 )
             self.sinks = sinks
 
-        self.supports_xqa_or_trtllm_gen_decode = can_use_trtllm_attention(
-            num_heads, num_kv_heads, is_prefill=False
+        self.supports_xqa_or_trtllm_gen_decode = is_decode_supported_for_config(
+            num_heads, num_kv_heads
         )
         vllm_config = get_current_vllm_config_or_none()
         self.supports_quant_query_input = (
@@ -930,16 +672,6 @@ class TRTLLMImpl(AttentionImpl):
             )
         else:
             self._nvfp4_fp8_out = None
-
-        dcp_a2a = (
-            vllm_config is not None
-            and vllm_config.parallel_config.decode_context_parallel_size > 1
-            and vllm_config.parallel_config.dcp_comm_backend == "a2a"
-        )
-        if dcp_a2a:
-            self.dcp_combine = dcp_a2a_lse_reduce
-        else:
-            self.dcp_combine = cp_lse_ag_out_rs
 
     def fused_output_quant_supported(self, quant_key: QuantKey):
         return (
@@ -1157,10 +889,6 @@ class TRTLLMImpl(AttentionImpl):
         assert is_strictly_contiguous(seq_lens_prefill)
 
         if output.dtype == FP4_DTYPE:
-            if self.dcp_world_size > 1:
-                raise NotImplementedError(
-                    "TRTLLM DCP does not support fused NVFP4 attention output."
-                )
             assert self.o_sf_scale is not None
             out = FP4Tensor(
                 data=output[num_decode_tokens:],
@@ -1172,29 +900,9 @@ class TRTLLMImpl(AttentionImpl):
             assert self.o_sf_scale is None
             out = output[num_decode_tokens:]
 
-        needs_fp8_out = (
-            self.dcp_world_size <= 1
-            and self.is_kvcache_nvfp4
-            and output.dtype != FP8_DTYPE
-        )
+        needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
         if needs_fp8_out:
             out = self._nvfp4_fp8_out[:num_prefill_tokens]
-
-        if self.dcp_world_size > 1:
-            self.forward_prefill_trtllm_dcp(
-                layer=layer,
-                prefill_query=prefill_query,
-                key=key,
-                value=value,
-                kv_cache_tuple=kv_cache_tuple,
-                nvfp4_kv_data=nvfp4_kv_data,
-                nvfp4_kv_block_scales=nvfp4_kv_block_scales,
-                attn_metadata=attn_metadata,
-                out=out,
-                num_decode_tokens=num_decode_tokens,
-                num_prefill_tokens=num_prefill_tokens,
-            )
-            return
 
         prefill_kv_block_scales = None
         if self.is_kvcache_nvfp4:
@@ -1257,30 +965,6 @@ class TRTLLMImpl(AttentionImpl):
                 out[:num_prefill_tokens].to(output.dtype)
             )
 
-    def forward_prefill_trtllm_dcp(
-        self,
-        layer: torch.nn.Module,
-        prefill_query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache_tuple: tuple[torch.Tensor, torch.Tensor],
-        nvfp4_kv_data: torch.Tensor | None,
-        nvfp4_kv_block_scales: torch.Tensor | None,
-        attn_metadata: TRTLLMMetadata,
-        out: torch.Tensor,
-        num_decode_tokens: int,
-        num_prefill_tokens: int,
-    ) -> None:
-        assert isinstance(attn_metadata.prefill, TRTLLMPrefill)
-        assert attn_metadata.dcp_context_kv_lens is not None
-        assert attn_metadata.max_dcp_context_kv_len is not None
-        assert self.sinks is None, "TRTLLM DCP does not support sinks"
-        raise NotImplementedError(
-            "TRTLLM DCP prefill requires an LSE-producing SM100 new-token "
-            "prefill path. The old FMHA-v2 suffix path is intentionally not "
-            "used because it only generates SM90/SM120 kernels."
-        )
-
     def forward_decode_trtllm(
         self,
         layer: torch.nn.Module,
@@ -1327,10 +1011,6 @@ class TRTLLMImpl(AttentionImpl):
         )
 
         if output.dtype == FP4_DTYPE:
-            if self.dcp_world_size > 1:
-                raise NotImplementedError(
-                    "TRTLLM DCP does not support fused NVFP4 attention output."
-                )
             assert self.o_sf_scale is not None
             out = FP4Tensor(
                 data=output[:num_decode_tokens],
@@ -1342,11 +1022,7 @@ class TRTLLMImpl(AttentionImpl):
             assert self.o_sf_scale is None
             out = output[:num_decode_tokens]
 
-        needs_fp8_out = (
-            self.dcp_world_size <= 1
-            and self.is_kvcache_nvfp4
-            and output.dtype != FP8_DTYPE
-        )
+        needs_fp8_out = self.is_kvcache_nvfp4 and output.dtype != FP8_DTYPE
         if needs_fp8_out:
             out = self._nvfp4_fp8_out[:num_decode_tokens]
 
@@ -1365,55 +1041,6 @@ class TRTLLMImpl(AttentionImpl):
             if decode_with_xqa
             else self.bmm1_scale
         )
-
-        if self.dcp_world_size > 1:
-            assert decode_with_trtllm_gen
-            assert attn_metadata.dcp_context_kv_lens is not None
-            assert attn_metadata.max_dcp_context_kv_len is not None
-            assert self.sinks is None, "TRTLLM DCP does not support sinks"
-            decode_query = get_dcp_group().all_gather(
-                decode_query.contiguous(), dim=1
-            )
-            dcp_out = torch.empty(
-                decode_query.shape,
-                dtype=out.dtype,
-                device=decode_query.device,
-            )
-            dcp_lse = torch.empty(
-                (decode_query.shape[0], decode_query.shape[1]),
-                dtype=torch.float32,
-                device=decode_query.device,
-            )
-            trtllm_batch_decode_with_kv_cache(
-                query=decode_query,
-                kv_cache=nvfp4_kv_data if self.is_kvcache_nvfp4 else kv_cache_tuple,
-                workspace_buffer=workspace_buffer,
-                block_tables=block_tables_decode,
-                seq_lens=attn_metadata.dcp_context_kv_lens[
-                    : attn_metadata.num_decodes
-                ],
-                max_seq_len=attn_metadata.max_dcp_context_kv_len,
-                bmm1_scale=bmm1_scale,
-                bmm2_scale=self.bmm2_scale,
-                window_left=self.window_left,
-                o_sf_scale=self.o_sf_scale,
-                out=dcp_out,
-                kv_layout=get_kv_cache_layout(),
-                backend=attn_metadata.decode.kernel.value,
-                q_len_per_req=q_len_per_req,
-                kv_cache_sf=nvfp4_kv_block_scales if self.is_kvcache_nvfp4 else None,
-                lse=dcp_lse,
-                return_lse=True,
-            )
-            out[:num_decode_tokens] = self.dcp_combine(
-                dcp_out,
-                dcp_lse,
-                get_dcp_group(),
-                is_lse_base_on_e=False,
-            )
-            if needs_fp8_out:
-                output[:num_decode_tokens].copy_(out.to(output.dtype))
-            return
 
         trtllm_batch_decode_with_kv_cache(
             query=decode_query,

@@ -39,10 +39,9 @@ def _clear_selection_caches():
     try:
         from vllm.utils.flashinfer import (
             has_nvidia_artifactory,
-            supports_trtllm_attention,
         )
 
-        cleared.extend([has_nvidia_artifactory, supports_trtllm_attention])
+        cleared.append(has_nvidia_artifactory)
     except ImportError:
         pass
 
@@ -168,37 +167,47 @@ def _reasons(
 def trtllm_kernels_available(monkeypatch):
     """Pretend both TRTLLM kernels exist, independent of host and artifactory.
 
-    Patched on the names ``trtllm.py`` imported, not at their definition site,
-    and deliberately not on ``supports_trtllm_attention``'s callers elsewhere.
+    Patched on ``trtllm.py``'s local capability predicate, not on FlashInfer
+    wrapper helpers.
     """
     pytest.importorskip("flashinfer")
     from vllm.v1.attention.backends import trtllm as trtllm_backend
 
-    monkeypatch.setattr(
-        trtllm_backend, "supports_trtllm_attention", lambda is_prefill=False: True
-    )
-    monkeypatch.setattr(
-        trtllm_backend, "can_use_trtllm_attention", lambda *a, **k: True
-    )
+    monkeypatch.setattr(trtllm_backend, "_trtllm_kernel_available", lambda **_: True)
     return trtllm_backend
 
 
 @pytest.mark.parametrize(
-    "capability,expected_ok",
-    [(SM90, False), (SM100, True), (SM103, True), (SM120, False)],
+    "capability,expected",
+    [
+        (SM90, "TRTLLM prefill kernel is not available on this platform"),
+        (SM100, None),
+        (SM103, None),
+        (SM120, "compute capability not supported"),
+    ],
     ids=["sm90", "sm100", "sm103", "sm120"],
 )
 def test_trtllm_compute_capability_gate(
-    capability, expected_ok, trtllm_kernels_available
+    capability, expected, monkeypatch
 ):
-    """TRTLLM is SM10x-only: SM90 has XQA decode but no TRTLLM prefill kernel."""
+    """SM90 can host XQA decode, but full TRTLLM needs a prefill kernel too."""
     _, trtllm_cls = _backends()
+    from vllm.v1.attention.backends import trtllm as trtllm_backend
+
+    def fake_kernel_available(*, is_prefill):
+        if capability == SM90:
+            return not is_prefill
+        return capability in (SM100, SM103)
+
+    monkeypatch.setattr(
+        trtllm_backend, "_trtllm_kernel_available", fake_kernel_available
+    )
     with set_current_vllm_config(_fake_vllm_config()):
         reasons = _reasons(trtllm_cls, capability=capability)
-    if expected_ok:
+    if expected is None:
         assert reasons == []
     else:
-        assert "compute capability not supported" in reasons
+        assert expected in reasons
 
 
 @pytest.mark.parametrize("capability", [SM90, SM100, SM103, SM120])
@@ -224,37 +233,52 @@ def test_flashinfer_rejects_outside_its_range(capability):
 def test_dcp_rejects_blackwell_trtllm_and_accepts_flashinfer(
     trtllm_kernels_available,
 ):
-    """Direct TRTLLM DCP needs an SM100 suffix-prefill LSE path first."""
+    """Direct TRTLLM does not claim DCP until it has a proven complete path."""
     flashinfer_cls, trtllm_cls = _backends()
     config = _fake_vllm_config(decode_context_parallel_size=2)
     with set_current_vllm_config(config):
-        assert (
-            "TRTLLM DCP prefill for SM100 requires an LSE-producing "
-            "SM100 new-token prefill path; FMHA-v2 only generates "
-            "SM90/SM120 kernels"
-        ) in _reasons(trtllm_cls, capability=SM103)
+        assert "TRTLLM decode context parallelism is not supported" in _reasons(
+            trtllm_cls, capability=SM103
+        )
         assert _reasons(flashinfer_cls, capability=SM103) == []
 
 
-def test_dcp_trtllm_rejects_attention_sinks(trtllm_kernels_available):
-    """The split DCP path must not double-count sink logits."""
+def test_trtllm_rejects_attention_sinks(trtllm_kernels_available):
+    """Sinks stay disabled until TRTLLM sink semantics are validated."""
     _, trtllm_cls = _backends()
     config = _fake_vllm_config(decode_context_parallel_size=2)
     with set_current_vllm_config(config):
-        assert "TRTLLM DCP with attention sinks is not supported" in _reasons(
+        assert "TRTLLM attention sinks are not supported" in _reasons(
             trtllm_cls, capability=SM103, has_sink=True
         )
 
 
-def test_trtllm_rejects_unservable_head_ratio(monkeypatch):
+def test_trtllm_rejects_unservable_prefill_head_ratio(trtllm_kernels_available):
     flashinfer_cls, trtllm_cls = _backends()
+    with set_current_vllm_config(
+        _fake_vllm_config(num_attention_heads=31, num_kv_heads=8)
+    ):
+        assert "TRTLLM prefill does not support this query/KV head ratio" in _reasons(
+            trtllm_cls, capability=SM103
+        )
+        assert _reasons(flashinfer_cls, capability=SM103) == []
+
+
+def test_trtllm_rejects_unservable_decode_head_ratio(
+    monkeypatch, trtllm_kernels_available
+):
+    _, trtllm_cls = _backends()
     from vllm.v1.attention.backends import trtllm as trtllm_backend
 
     monkeypatch.setattr(
-        trtllm_backend, "supports_trtllm_attention", lambda is_prefill=False: True
+        trtllm_backend,
+        "is_prefill_supported_for_config",
+        lambda num_qo_heads, num_kv_heads: True,
     )
     monkeypatch.setattr(
-        trtllm_backend, "can_use_trtllm_attention", lambda *a, **k: False
+        trtllm_backend,
+        "is_decode_supported_for_config",
+        lambda num_qo_heads, num_kv_heads: False,
     )
     with set_current_vllm_config(_fake_vllm_config()):
         assert "TRTLLM decode does not support this query/KV head ratio" in _reasons(
@@ -262,50 +286,31 @@ def test_trtllm_rejects_unservable_head_ratio(monkeypatch):
         )
 
 
-def test_trtllm_requires_both_prefill_and_decode_kernels(monkeypatch):
-    """SM90's real shape: decode kernel present, prefill kernel absent."""
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_trtllm_reports_prefill_and_decode_kernel_availability_separately(
+    monkeypatch, phase
+):
     _, trtllm_cls = _backends()
     from vllm.v1.attention.backends import trtllm as trtllm_backend
 
     monkeypatch.setattr(
         trtllm_backend,
-        "supports_trtllm_attention",
-        lambda is_prefill=False: not is_prefill,
+        "_trtllm_kernel_available",
+        lambda *, is_prefill: (phase != "prefill" if is_prefill else phase != "decode"),
     )
+    expected = f"TRTLLM {phase} kernel is not available on this platform"
     with set_current_vllm_config(_fake_vllm_config()):
-        assert "TRTLLM prefill and decode kernels are not both available" in _reasons(
-            trtllm_cls, capability=SM103
-        )
+        assert expected in _reasons(trtllm_cls, capability=SM103)
 
 
-@pytest.mark.parametrize(
-    "disable_q_quant,expect_rejected",
-    [(True, True), (False, False)],
-    ids=["q-quant-disabled", "q-quant-enabled"],
-)
-def test_trtllm_fp8_kv_depends_on_query_quantization(
-    disable_q_quant, expect_rejected, trtllm_kernels_available
+def test_trtllm_fp8_kv_does_not_depend_on_query_quantization(
+    trtllm_kernels_available,
 ):
-    """With a quantized KV cache, TRTLLM prefill is only auto-selected when the
-    query is quantized to FP8 alongside it. ``build`` has no fallback, so the
-    mismatch has to be caught at selection time."""
-    _, trtllm_cls = _backends()
-    config = _fake_vllm_config(disable_flashinfer_q_quantization=disable_q_quant)
-    with set_current_vllm_config(config):
-        reasons = _reasons(trtllm_cls, capability=SM103, kv_cache_dtype="fp8")
-    rejected = any(r.startswith("TRTLLM prefill is not selected") for r in reasons)
-    assert rejected is expect_rejected
-
-
-def test_trtllm_large_block_size_forces_the_prefill_path(trtllm_kernels_available):
-    """Pages >= 128 are served only by trtllm-gen, so they override the flag."""
     _, trtllm_cls = _backends()
     config = _fake_vllm_config(disable_flashinfer_q_quantization=True)
     with set_current_vllm_config(config):
-        reasons = _reasons(
-            trtllm_cls, capability=SM103, kv_cache_dtype="fp8", block_size=128
-        )
-    assert not any(r.startswith("TRTLLM prefill is not selected") for r in reasons)
+        reasons = _reasons(trtllm_cls, capability=SM103, kv_cache_dtype="fp8")
+    assert reasons == []
 
 
 def test_trtllm_rejects_non_causal_and_flashinfer_accepts_it(trtllm_kernels_available):
@@ -320,7 +325,7 @@ def test_trtllm_rejects_non_causal_and_flashinfer_accepts_it(trtllm_kernels_avai
 
 
 def test_flashinfer_rejects_attention_sinks():
-    """Sinks are why a gpt-oss-style model lands on TRTLLM on Blackwell."""
+    """FlashInfer wrapper does not advertise sink support."""
     flashinfer_cls, _ = _backends()
     assert flashinfer_cls.supports_sink() is False
     with set_current_vllm_config(_fake_vllm_config()):
