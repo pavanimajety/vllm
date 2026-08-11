@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Integration tests for TRTLLM gen-full attention through FlashInfer."""
+"""Integration tests for direct TRTLLM attention through FlashInfer APIs."""
 
 import unittest.mock
 from functools import partial
@@ -25,17 +25,20 @@ from vllm.v1.attention.backends.utils import (
 )
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
 
-if not current_platform.is_device_capability_family(100):
+if not (
+    current_platform.is_device_capability(90)
+    or current_platform.is_device_capability_family(100)
+):
     pytest.skip(
-        "TRTLLM integration tests require NVIDIA Blackwell (SM100).",
+        "TRTLLM integration tests require NVIDIA Hopper (SM90) or Blackwell (SM100).",
         allow_module_level=True,
     )
 
-from vllm.v1.attention.backends.flashinfer import (  # noqa: E402
-    FlashInferDecodeKernel,
-    FlashInferImpl,
-    FlashInferMetadataBuilder,
-    FlashInferTrtllmAPIDecode,
+from vllm.v1.attention.backends.trtllm import (  # noqa: E402
+    TRTLLMDecode,
+    TrtllmDecodeAPIKernel,
+    TRTLLMImpl,
+    TRTLLMMetadataBuilder,
     TRTLLMPrefill,
 )
 
@@ -285,8 +288,14 @@ def _create_nvfp4_hnd_kv_cache(
 
 
 def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL):
-    """Run TRTLLM attention through the full FlashInfer pipeline
+    """Run TRTLLM attention through the full TRTLLM pipeline
     and compare against an SDPA reference."""
+    if not current_platform.is_device_capability_family(100):
+        if kv_cache_dtype == "nvfp4":
+            pytest.skip("TRTLLM nvfp4 KV cache integration requires SM100.")
+        if any(query_len > 1 for query_len in batch_spec.query_lens):
+            pytest.skip("TRTLLM prefill/mixed integration requires SM100.")
+
     set_random_seed(42)
     device = torch.device(f"{DEVICE_TYPE}:0")
 
@@ -395,7 +404,7 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
             common_attn_metadata,
         )
 
-    # 3. Run through FlashInfer with TRTLLM enabled
+    # 3. Run through TRTLLM with the FlashInfer-exported direct APIs.
     set_kv_cache_layout("HND")
     get_kv_cache_layout.cache_clear()
 
@@ -419,11 +428,11 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                 return_value=True,
             ),
             unittest.mock.patch(
-                "vllm.v1.attention.backends.flashinfer.get_per_layer_parameters",
+                "vllm.v1.attention.backends.trtllm.get_per_layer_parameters",
                 _mock_get_per_layer_parameters,
             ),
         ):
-            builder = FlashInferMetadataBuilder(
+            builder = TRTLLMMetadataBuilder(
                 kv_cache_spec, layer_names, vllm_config, device
             )
             attn_metadata = builder.build(
@@ -440,13 +449,17 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
                     f"Expected TRTLLMPrefill, got {type(attn_metadata.prefill)}"
                 )
             if has_decodes:
-                assert isinstance(attn_metadata.decode, FlashInferTrtllmAPIDecode), (
-                    "Expected FlashInferTrtllmAPIDecode, got "
-                    f"{type(attn_metadata.decode)}"
+                assert isinstance(attn_metadata.decode, TRTLLMDecode), (
+                    f"Expected TRTLLMDecode, got {type(attn_metadata.decode)}"
                 )
-                assert attn_metadata.decode.kernel == FlashInferDecodeKernel.TRTLLM_GEN
+                expected_decode_kernel = (
+                    TrtllmDecodeAPIKernel.TRTLLM_GEN
+                    if current_platform.is_device_capability_family(100)
+                    else TrtllmDecodeAPIKernel.XQA
+                )
+                assert attn_metadata.decode.kernel == expected_decode_kernel
 
-            impl = FlashInferImpl(
+            impl = TRTLLMImpl(
                 num_heads=num_q_heads,
                 head_size=head_size,
                 scale=scale,
@@ -522,9 +535,7 @@ def _run_trtllm_integration(batch_spec, kv_cache_dtype="auto", model_name=MODEL)
 )
 @torch.inference_mode()
 def test_trtllm_gen_full_attention_integration(batch_spec_name: str):
-    """Test TRTLLM gen-full attention through the full FlashInfer
-    MetadataBuilder.build() -> FlashInferImpl.forward() pipeline,
-    with real TRTLLM kernels on Blackwell."""
+    """Test TRTLLM through MetadataBuilder.build() -> TRTLLMImpl.forward()."""
     _run_trtllm_integration(BATCH_SPECS[batch_spec_name])
 
 
@@ -535,7 +546,7 @@ def test_trtllm_gen_full_attention_integration(batch_spec_name: str):
 @torch.inference_mode()
 def test_trtllm_gen_nvfp4_kv_integration(batch_spec_name: str):
     """Test TRTLLM attention with nvfp4 KV cache through the full
-    FlashInfer MetadataBuilder.build() -> FlashInferImpl.forward() pipeline."""
+    TRTLLM MetadataBuilder.build() -> TRTLLMImpl.forward() pipeline."""
     _run_trtllm_integration(
         BATCH_SPECS[batch_spec_name],
         kv_cache_dtype="nvfp4",
