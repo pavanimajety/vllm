@@ -548,6 +548,7 @@ class GPUModelRunner(
         # Set to True after init_routed_experts_capturer() completes.
         # Prevents routed experts code from running during profiling/dummy run.
         self.routed_experts_initialized = False
+        self._router_topk_engine_iteration = 0
         self.max_model_len = model_config.max_model_len
 
         # Always set to false after the first forward pass
@@ -1317,6 +1318,7 @@ class GPUModelRunner(
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                trace_headers=new_req_data.trace_headers,
             )
             self.requests[req_id] = req_state
             self.late_interaction_runner.register_request(req_id, pooling_params)
@@ -4315,6 +4317,13 @@ class GPUModelRunner(
                     return EMPTY_MODEL_RUNNER_OUTPUT
                 return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
 
+            router_topk_dumper = getattr(self, "router_topk_bitmap_dumper", None)
+            if router_topk_dumper is not None:
+                router_topk_dumper.set_engine_iteration(
+                    self._router_topk_engine_iteration
+                )
+                self._router_topk_engine_iteration += 1
+
             if self.cache_config.kv_sharing_fast_prefill:
                 assert not self.num_prompt_logprobs, (
                     "--kv-sharing-fast-prefill produces incorrect "
@@ -4325,6 +4334,15 @@ class GPUModelRunner(
             num_reqs = self.input_batch.num_reqs
             req_ids = self.input_batch.req_ids
             tokens = [scheduler_output.num_scheduled_tokens[i] for i in req_ids]
+            if router_topk_dumper is not None:
+                router_topk_dumper.set_request_spans(
+                    req_ids,
+                    tokens,
+                    {
+                        req_id: self.requests[req_id].trace_headers
+                        for req_id in req_ids
+                    },
+                )
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
             num_tokens_unpadded = scheduler_output.total_num_scheduled_tokens

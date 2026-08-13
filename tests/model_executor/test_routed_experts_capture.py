@@ -1,6 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
+import threading
 import types
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -14,6 +17,7 @@ from vllm.model_executor.layers.fused_moe.config import RoutingMethodType
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsCapturer,
     RoutedExpertsManager,
+    RouterTopKBitmapDumper,
     bind_routed_experts_capturer,
     get_routed_experts_attn_gid,
 )
@@ -466,3 +470,95 @@ def test_v2_model_runner_accepts_routed_experts(monkeypatch):
     unsupported = VllmConfig._get_v2_model_runner_unsupported_features(config)
 
     assert "routed experts capture" not in unsupported
+
+
+def _dumper_for_cpu_test(tmp_path):
+    dumper = RouterTopKBitmapDumper.__new__(RouterTopKBitmapDumper)
+    dumper.output_dir = tmp_path
+    dumper.dp_rank = 0
+    dumper.tp_size = 1
+    dumper.rank = 0
+    dumper.local_rank = 0
+    dumper.role = "decode"
+    dumper._lock = threading.Lock()
+    dumper._step_by_layer = defaultdict(int)
+    dumper._engine_iteration = None
+    dumper._request_spans = []
+    return dumper
+
+
+def test_router_topk_bitmap_dumper_serializes_request_spans(tmp_path):
+    dumper = _dumper_for_cpu_test(tmp_path)
+    dumper.set_engine_iteration(7)
+    dumper.set_request_spans(
+        ["internal-a", "internal-b"],
+        [2, 1],
+        {
+            "internal-a": {
+                "x-request-id": "request-a",
+                "x-correlation-id": "correlation-a",
+            },
+            "internal-b": {
+                "x-request-id": "request-b",
+            },
+        },
+    )
+
+    with patch(
+        f"{_REC_MODULE}.get_forward_context",
+        return_value=SimpleNamespace(dp_metadata=None),
+    ):
+        dumper.capture(
+            layer_id=4,
+            topk_ids=torch.tensor([[0, 1], [1, 2], [2, 3]], dtype=torch.int64),
+            num_logical_experts=8,
+        )
+
+    jsonl_path = tmp_path / "layer_004.rank_000.jsonl"
+    record = json.loads(jsonl_path.read_text().strip())
+    assert record["step"] == 7
+    assert record["num_tokens"] == 3
+    assert record["request_spans"] == [
+        {
+            "request_id": "request-a",
+            "internal_request_id": "internal-a",
+            "correlation_id": "correlation-a",
+            "token_start": 0,
+            "token_count": 2,
+        },
+        {
+            "request_id": "request-b",
+            "internal_request_id": "internal-b",
+            "correlation_id": None,
+            "token_start": 2,
+            "token_count": 1,
+        },
+    ]
+
+
+def test_router_topk_bitmap_dumper_clips_local_dp_spans():
+    dumper = _dumper_for_cpu_test(None)
+    dumper.set_request_spans(
+        ["request-a", "request-b"],
+        [2, 1],
+        {},
+    )
+
+    # start/end are global offsets, but the request list is local to the
+    # captured DP rank. The dumper should keep local token offsets.
+    assert dumper._slice_request_spans(2, 5) == [
+        {
+            "request_id": "request-a",
+            "internal_request_id": "request-a",
+            "correlation_id": None,
+            "token_start": 0,
+            "token_count": 2,
+        },
+        {
+            "request_id": "request-b",
+            "internal_request_id": "request-b",
+            "correlation_id": None,
+            "token_start": 2,
+            "token_count": 1,
+        },
+    ]

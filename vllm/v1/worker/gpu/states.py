@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Mapping
+
 import numpy as np
 import torch
 
@@ -26,6 +28,7 @@ class RequestState:
 
         self.req_id_to_index: dict[str, int] = {}
         self.index_to_req_id: dict[int, str] = {}
+        self.trace_headers_by_req_id: dict[str, Mapping[str, str] | None] = {}
         self.free_indices = list(range(max_num_reqs))
 
         # NOTE(woosuk): This tensor can be extremely large (e.g., several GBs)
@@ -95,11 +98,13 @@ class RequestState:
         all_token_ids: list[int],
         num_computed_tokens: int,
         max_tokens: int,
+        trace_headers: Mapping[str, str] | None = None,
     ) -> None:
         assert len(self.free_indices) > 0, "No free indices"
         req_idx = self.free_indices.pop()
         self.req_id_to_index[req_id] = req_idx
         self.index_to_req_id[req_idx] = req_id
+        self.trace_headers_by_req_id[req_id] = trace_headers
 
         self.max_seq_len[req_idx] = prompt_len + max_tokens
         self.prompt_len.np[req_idx] = prompt_len
@@ -129,5 +134,6 @@ class RequestState:
         if req_idx is None:
             return None
         self.index_to_req_id.pop(req_idx, None)
+        self.trace_headers_by_req_id.pop(req_id, None)
         self.free_indices.append(req_idx)
         return req_idx

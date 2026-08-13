@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Datastructures defining a GPU input batch
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import cast
 
@@ -56,6 +57,9 @@ class CachedRequestState:
     # Per-position mask for mixed-mode inputs (e.g chat completion with
     # prompt_embeds content parts). See `Request.prompt_is_token_ids`.
     prompt_is_token_ids: list[bool] | None = None
+
+    # HTTP/AIPerf request metadata used by diagnostic instrumentation.
+    trace_headers: Mapping[str, str] | None = None
 
     # Used when both async_scheduling and spec_decode are enabled.
     prev_num_draft_len: int = 0

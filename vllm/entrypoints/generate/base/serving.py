@@ -46,6 +46,16 @@ _T = TypeVar("_T")
 SESSION_ID_HEADER = "X-Session-ID"
 PRIORITY_HEADER = "X-Vllm-Priority"
 
+# These headers are request metadata rather than OpenTelemetry context, but
+# ``trace_headers`` is already carried from the HTTP boundary through the
+# engine and scheduler to the worker request state. Keeping the metadata in
+# that existing propagation path avoids adding a second request-context wire
+# format for diagnostic logging.
+REQUEST_CONTEXT_HEADERS = (
+    "x-request-id",
+    "x-correlation-id",
+)
+
 
 def build_per_request_timing_metrics(
     metrics: RequestStateStats | None,
@@ -226,13 +236,20 @@ class GenerateBaseServing(BaseServing, BeamSearchOnlineMixin):
     ) -> Mapping[str, str] | None:
         is_tracing_enabled = await self.engine_client.is_tracing_enabled()
 
+        request_context_headers = {
+            header: headers[header]
+            for header in REQUEST_CONTEXT_HEADERS
+            if header in headers
+        }
+
         if is_tracing_enabled:
-            return extract_trace_headers(headers)
+            request_context_headers.update(extract_trace_headers(headers))
+            return request_context_headers or None
 
         if contains_trace_headers(headers):
             log_tracing_disabled_warning()
 
-        return None
+        return request_context_headers or None
 
     @staticmethod
     def _get_data_parallel_rank(raw_request: Request | None) -> int | None:
