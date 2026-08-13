@@ -10,7 +10,9 @@ import logging
 import os
 import struct
 import threading
+import time
 from collections import defaultdict
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -264,20 +266,120 @@ class RouterTopKBitmapDumper:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.rank = _resolve_int_env("RANK", "SLURM_PROCID") or 0
         self.local_rank = _resolve_int_env("LOCAL_RANK", "SLURM_LOCALID")
+        self.role = os.environ.get("VLLM_ROUTER_TOPK_BITMAP_ROLE")
         self._lock = threading.Lock()
         self._step_by_layer: dict[int, int] = defaultdict(int)
+        self._engine_iteration: int | None = None
+        self._request_spans: list[dict[str, object]] = []
         logger.info(
             "RouterTopKBitmapDumper: writing router top-k bitmaps to %s "
-            "(rank=%d, local_rank=%s)",
+            "(rank=%d, local_rank=%s, role=%s)",
             self.output_dir,
             self.rank,
             self.local_rank,
+            self.role,
         )
 
-    def _slice_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+    def set_engine_iteration(self, engine_iteration: int) -> None:
+        self._engine_iteration = engine_iteration
+
+    def set_request_spans(
+        self,
+        req_ids: Sequence[str],
+        token_counts: Sequence[int],
+        request_headers: Mapping[str, Mapping[str, str] | None],
+    ) -> None:
+        """Set request/token spans for the next model execution.
+
+        Router hooks only receive the flattened token-by-token ``topk_ids``
+        tensor. The runner owns the batch ordering and therefore supplies the
+        request spans separately so the dumper can preserve request metadata
+        without trying to infer it from expert IDs.
+        """
+        if len(req_ids) != len(token_counts):
+            raise ValueError(
+                "RouterTopKBitmapDumper: req_ids and token_counts must have "
+                "the same length"
+            )
+
+        spans: list[dict[str, object]] = []
+        token_start = 0
+        for req_id, raw_token_count in zip(req_ids, token_counts, strict=True):
+            token_count = int(raw_token_count)
+            if token_count < 0:
+                raise ValueError(
+                    "RouterTopKBitmapDumper: token count cannot be negative"
+                )
+            headers = request_headers.get(req_id) or {}
+            spans.append(
+                {
+                    "request_id": headers.get("x-request-id", req_id),
+                    "internal_request_id": req_id,
+                    "correlation_id": headers.get("x-correlation-id"),
+                    "token_start": token_start,
+                    "token_count": token_count,
+                }
+            )
+            token_start += token_count
+        self._request_spans = spans
+
+    def _slice_request_spans(self, start: int, end: int) -> list[dict[str, object]]:
+        """Clip request spans to the rows written by this worker."""
+        if not self._request_spans:
+            return []
+
+        source_tokens = sum(
+            int(span["token_count"]) for span in self._request_spans
+        )
+        captured_tokens = end - start
+        if start < 0 or end < start:
+            raise AssertionError(
+                "RouterTopKBitmapDumper: top-k token span exceeds the "
+                f"request metadata span (start={start}, end={end}, "
+                f"metadata_tokens={source_tokens})"
+            )
+
+        # In internal DP dispatch, the router can see the concatenated token
+        # tensor while the runner only knows this rank's request list. In
+        # that case the metadata is local to the captured slice even though
+        # ``start`` is a global DP offset.
+        if source_tokens == captured_tokens:
+            start, end = 0, source_tokens
+        elif end > source_tokens:
+            raise AssertionError(
+                "RouterTopKBitmapDumper: top-k token span exceeds the "
+                f"request metadata span (start={start}, end={end}, "
+                f"metadata_tokens={source_tokens})"
+            )
+
+        clipped: list[dict[str, object]] = []
+        for span in self._request_spans:
+            span_start = int(span["token_start"])
+            span_end = span_start + int(span["token_count"])
+            overlap_start = max(start, span_start)
+            overlap_end = min(end, span_end)
+            if overlap_start >= overlap_end:
+                continue
+            clipped_span = dict(span)
+            clipped_span["token_start"] = overlap_start - start
+            clipped_span["token_count"] = overlap_end - overlap_start
+            clipped.append(clipped_span)
+
+        clipped_tokens = sum(int(span["token_count"]) for span in clipped)
+        if clipped_tokens != end - start:
+            raise AssertionError(
+                "RouterTopKBitmapDumper: request metadata does not cover "
+                f"the captured token rows (covered={clipped_tokens}, "
+                f"captured={end - start})"
+            )
+        return clipped
+
+    def _slice_topk_ids_with_bounds(
+        self, topk_ids: torch.Tensor
+    ) -> tuple[torch.Tensor, int, int]:
         ctx = get_forward_context()
         if ctx.dp_metadata is None:
-            return topk_ids
+            return topk_ids, 0, topk_ids.shape[0]
 
         num_tokens_dp = ctx.dp_metadata.num_tokens_across_dp_cpu
         token_num_per_dp = int(num_tokens_dp[self.dp_rank].item())
@@ -288,15 +390,16 @@ class RouterTopKBitmapDumper:
             cumsum = torch.cumsum(num_tokens_dp, dim=0)
             end_loc = int(cumsum[self.dp_rank].item())
             start_loc = end_loc - token_num_per_dp
-            return topk_ids[start_loc:end_loc, :]
+            return topk_ids[start_loc:end_loc, :], start_loc, end_loc
         if n == token_num_per_dp:
-            return topk_ids
+            return topk_ids, 0, n
         if (
             self.tp_size > 1
             and n != token_num_per_dp
             and n == (token_num_per_dp + self.tp_size - 1) // self.tp_size
         ):
-            return get_tp_group().all_gather(topk_ids, dim=0)[:token_num_per_dp, :]
+            gathered = get_tp_group().all_gather(topk_ids, dim=0)
+            return gathered[:token_num_per_dp, :], 0, token_num_per_dp
 
         sp_expected = (
             (token_num_per_dp + self.tp_size - 1) // self.tp_size
@@ -308,6 +411,9 @@ class RouterTopKBitmapDumper:
             f"{n} (expected {total}, {token_num_per_dp}, or {sp_expected} "
             f"for dp_rank={self.dp_rank}, tp_size={self.tp_size})"
         )
+
+    def _slice_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
+        return self._slice_topk_ids_with_bounds(topk_ids)[0]
 
     @staticmethod
     def _encode_bitmap_bytes(
@@ -350,36 +456,53 @@ class RouterTopKBitmapDumper:
         num_logical_experts: int,
     ) -> None:
         if topk_ids.is_cuda and torch.cuda.is_current_stream_capturing():
-            return
+            raise RuntimeError(
+                "RouterTopKBitmapDumper cannot capture router top-k IDs during "
+                "CUDA graph capture; run the metrics path in eager mode"
+            )
 
-        sliced = self._slice_topk_ids(topk_ids)
+        sliced, start_loc, end_loc = self._slice_topk_ids_with_bounds(topk_ids)
         topk_ids_cpu = sliced.detach().to("cpu", dtype=torch.int64)
         num_tokens = int(topk_ids_cpu.shape[0])
         top_k = int(topk_ids_cpu.shape[1]) if topk_ids_cpu.ndim == 2 else 0
         words_per_token = (num_logical_experts + 63) // 64
         payload = self._encode_bitmap_bytes(topk_ids_cpu, num_logical_experts)
         counts = self._counts(topk_ids_cpu, num_logical_experts)
+        request_spans = self._slice_request_spans(start_loc, end_loc)
+        if request_spans and sum(
+            int(span["token_count"]) for span in request_spans
+        ) != num_tokens:
+            raise AssertionError(
+                "RouterTopKBitmapDumper: request metadata token count does not "
+                "match captured top-k rows"
+            )
 
         base = f"layer_{layer_id:03d}.rank_{self.rank:03d}"
         bitmap_path = self.output_dir / f"{base}.token_expert_bitmap.u64"
         jsonl_path = self.output_dir / f"{base}.jsonl"
 
         with self._lock:
-            step = self._step_by_layer[layer_id]
+            record_sequence = self._step_by_layer[layer_id]
             self._step_by_layer[layer_id] += 1
+            engine_iteration = self._engine_iteration
+            step = engine_iteration if engine_iteration is not None else record_sequence
             offset_bytes = bitmap_path.stat().st_size if bitmap_path.exists() else 0
             with bitmap_path.open("ab") as f:
                 f.write(payload)
             record = {
-                "schema": "router_topk_bitmap_v1",
                 "rank": self.rank,
                 "local_rank": self.local_rank,
+                "role": self.role,
                 "step": step,
+                "engine_iteration": engine_iteration,
+                "record_sequence": record_sequence,
+                "timestamp_ns": time.time_ns(),
                 "layer": layer_id,
                 "num_logical_experts": num_logical_experts,
                 "num_tokens": num_tokens,
                 "top_k": top_k,
                 "counts": counts,
+                "request_spans": request_spans,
                 "token_expert_bitmap": {
                     "path": bitmap_path.name,
                     "offset_bytes": offset_bytes,

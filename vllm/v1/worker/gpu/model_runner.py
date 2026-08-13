@@ -279,6 +279,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
+        self._router_topk_engine_iteration = 0
 
         # Expert parallelism load balancer.
         self.eplb = EPLBController(self.parallel_config, self.device)
@@ -549,6 +550,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             output_dir=output_dir,
             vllm_config=self.vllm_config,
         )
+        self.router_topk_bitmap_dumper = dumper
         self._bind_router_topk_bitmap_dumper(dumper)
 
     def _bind_router_topk_bitmap_dumper(self, dumper: RouterTopKBitmapDumper) -> None:
@@ -890,6 +892,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 all_token_ids=new_req_data.prefill_token_ids,
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 max_tokens=sampling_params.max_tokens if sampling_params else 1,  # type: ignore[arg-type]
+                trace_headers=new_req_data.trace_headers,
             )
             req_index = self.req_states.req_id_to_index[req_id]
 
@@ -1260,6 +1263,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 empty_output = self.kv_connector.no_forward(scheduler_output)
                 return empty_output
 
+            router_topk_dumper = getattr(self, "router_topk_bitmap_dumper", None)
+            if router_topk_dumper is not None:
+                router_topk_dumper.set_engine_iteration(
+                    self._router_topk_engine_iteration
+                )
+                self._router_topk_engine_iteration += 1
+
         # Get batch descriptor and sync across DP ranks.
         num_reqs = len(scheduler_output.num_scheduled_tokens)
         num_toks = scheduler_output.total_num_scheduled_tokens
@@ -1300,6 +1310,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Common case.
             # Prepare all the inputs and copy to the input buffers.
             input_batch = self.prepare_inputs(scheduler_output, batch_desc)
+            if router_topk_dumper is not None:
+                router_topk_dumper.set_request_spans(
+                    input_batch.req_ids,
+                    input_batch.num_scheduled_tokens,
+                    self.req_states.trace_headers_by_req_id,
+                )
             block_tables, slot_mappings = self.prepare_attn(input_batch)
             # Mamba "align" pre-copy: migrate recurrent state across block
             # boundaries before the forward. Runs only on real batches, and

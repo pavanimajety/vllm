@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from typing import TYPE_CHECKING
@@ -47,6 +48,9 @@ class NewRequestData:
     # Only used for v2 model runner.
     prefill_token_ids: list[int] | None = None
 
+    # Request metadata propagated to worker-side diagnostic instrumentation.
+    trace_headers: Mapping[str, str] | None = None
+
     @classmethod
     def from_request(
         cls,
@@ -66,6 +70,7 @@ class NewRequestData:
             prompt_embeds=request.prompt_embeds,
             prompt_is_token_ids=request.prompt_is_token_ids,
             prefill_token_ids=prefill_token_ids,
+            trace_headers=request.trace_headers,
         )
 
     def __repr__(self) -> str:
