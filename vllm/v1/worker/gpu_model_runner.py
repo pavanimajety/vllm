@@ -4338,10 +4338,7 @@ class GPUModelRunner(
                 router_topk_dumper.set_request_spans(
                     req_ids,
                     tokens,
-                    {
-                        req_id: self.requests[req_id].trace_headers
-                        for req_id in req_ids
-                    },
+                    {req_id: self.requests[req_id].trace_headers for req_id in req_ids},
                 )
             num_scheduled_tokens_np = np.array(tokens, dtype=np.int32)
             max_num_scheduled_tokens = int(num_scheduled_tokens_np.max())
