@@ -8,6 +8,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
+import socket
 import struct
 import threading
 import time
@@ -35,8 +37,86 @@ def _resolve_int_env(*names: str) -> int | None:
         try:
             return int(value)
         except ValueError:
-            return None
+            continue
     return None
+
+
+def _sanitize_filename_component(value: str, field_name: str) -> str:
+    sanitized = re.sub(r"[^A-Za-z0-9_.-]+", "_", value).strip("._")
+    if not sanitized:
+        raise RuntimeError(
+            "RouterTopKBitmapDumper: required "
+            f"{field_name} cannot be represented in a filename"
+        )
+    return sanitized
+
+
+def _resolve_writer_ranks(env_value: str | None) -> frozenset[int] | None:
+    """Parse ``VLLM_ROUTER_TOPK_BITMAP_WRITER_RANKS``.
+
+    ``None`` means every rank writes. Under TP the router top-k tensor is
+    identical on all TP ranks, so restricting the writer set removes redundant
+    copies of the same payload without changing the record schema.
+    """
+    if env_value is None or not env_value.strip():
+        return None
+    ranks: set[int] = set()
+    for token in env_value.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            rank = int(token)
+        except ValueError:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: "
+                "VLLM_ROUTER_TOPK_BITMAP_WRITER_RANKS must be a "
+                f"comma-separated list of ranks; got {env_value!r}"
+            ) from None
+        if rank < 0:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: "
+                f"VLLM_ROUTER_TOPK_BITMAP_WRITER_RANKS rank {rank} is negative"
+            )
+        ranks.add(rank)
+    if not ranks:
+        raise RuntimeError(
+            "RouterTopKBitmapDumper: VLLM_ROUTER_TOPK_BITMAP_WRITER_RANKS is "
+            "set but selects no rank; unset it to let every rank write"
+        )
+    return frozenset(ranks)
+
+
+def _header_value(
+    headers: Mapping[str, str] | None,
+    name: str,
+) -> str | None:
+    if not headers:
+        return None
+    wanted = name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == wanted:
+            return value or None
+    return None
+
+
+def _resolve_physical_gpu_id() -> int:
+    """Resolve the physical GPU, accounting for visible-device remapping."""
+    try:
+        visible_gpu_id = int(torch.cuda.current_device())
+        physical_gpu_id = current_platform.visible_device_id_to_physical_device_id(
+            visible_gpu_id
+        )
+        physical_gpu_id = int(physical_gpu_id)
+    except Exception as exc:
+        raise RuntimeError(
+            "RouterTopKBitmapDumper: could not resolve the physical GPU ID"
+        ) from exc
+    if physical_gpu_id < 0:
+        raise RuntimeError(
+            "RouterTopKBitmapDumper: physical GPU ID must be non-negative"
+        )
+    return physical_gpu_id
 
 
 def _get_num_experts_per_tok(hf_config) -> int:
@@ -255,33 +335,102 @@ class RouterTopKBitmapDumper:
 
     This diagnostic dumper is intentionally independent of EPLB. It records
     logical expert IDs immediately after router top-k selection and before any
-    EPLB remapping. Each worker writes rank-specific files to avoid multi-rank
-    append races on shared filesystems.
+    EPLB remapping. Each worker writes files keyed by both logical rank and
+    physical writer identity to avoid multi-rank append races and collisions on
+    shared filesystems. ``rank``, ``local_rank``, and ``dp_rank`` describe the
+    logical distributed process; ``gpu_id`` and ``hostname`` identify the
+    physical writer.
     """
 
     def __init__(self, output_dir: str, vllm_config: VllmConfig) -> None:
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
         self.dp_rank = vllm_config.parallel_config.data_parallel_rank
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
-        self.rank = _resolve_int_env("RANK", "SLURM_PROCID") or 0
+        self.rank = _resolve_int_env("RANK", "SLURM_PROCID")
         self.local_rank = _resolve_int_env("LOCAL_RANK", "SLURM_LOCALID")
         self.role = os.environ.get("VLLM_ROUTER_TOPK_BITMAP_ROLE")
+        self.hostname = socket.gethostname()
+        self.physical_gpu_id = _resolve_physical_gpu_id()
+
+        if self.rank is None or self.rank < 0:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: RANK or SLURM_PROCID must be a "
+                "non-negative integer"
+            )
+        if self.local_rank is None or self.local_rank < 0:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: LOCAL_RANK or SLURM_LOCALID must be a "
+                "non-negative integer"
+            )
+        if self.dp_rank is None or int(self.dp_rank) < 0:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: a non-negative data-parallel rank is required"
+            )
+        if not self.role:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: VLLM_ROUTER_TOPK_BITMAP_ROLE is required"
+            )
+        if not self.hostname:
+            raise RuntimeError(
+                "RouterTopKBitmapDumper: hostname is required for writer identity"
+            )
+
+        self.rank = int(self.rank)
+        self.local_rank = int(self.local_rank)
+        self.dp_rank = int(self.dp_rank)
+        _sanitize_filename_component(self.role, "role")
+        _sanitize_filename_component(self.hostname, "hostname")
+
+        self.writer_ranks = _resolve_writer_ranks(
+            os.environ.get("VLLM_ROUTER_TOPK_BITMAP_WRITER_RANKS")
+        )
+        self.is_writer = self.writer_ranks is None or self.rank in self.writer_ranks
+
+        self.output_dir = Path(output_dir)
+        self.output_dir.mkdir(parents=True, exist_ok=True)
         self._lock = threading.Lock()
         self._step_by_layer: dict[int, int] = defaultdict(int)
         self._engine_iteration: int | None = None
+        self._active_engine_iteration: int | None = None
+        self._active_request_token_count: int | None = None
+        self._captured_layers: set[int] = set()
         self._request_spans: list[dict[str, object]] = []
+        self._session_request_ordinals: dict[str, dict[str, int]] = defaultdict(dict)
+        self._next_session_request_ordinal: dict[str, int] = defaultdict(int)
         logger.info(
             "RouterTopKBitmapDumper: writing router top-k bitmaps to %s "
-            "(rank=%d, local_rank=%s, role=%s)",
+            "(hostname=%s, gpu_id=%d, rank=%d, local_rank=%d, dp_rank=%d, "
+            "role=%s, is_writer=%s, writer_ranks=%s)",
             self.output_dir,
+            self.hostname,
+            self.physical_gpu_id,
             self.rank,
             self.local_rank,
+            self.dp_rank,
             self.role,
+            self.is_writer,
+            "all" if self.writer_ranks is None else sorted(self.writer_ranks),
         )
 
     def set_engine_iteration(self, engine_iteration: int) -> None:
-        self._engine_iteration = engine_iteration
+        with self._lock:
+            # A real execution with scheduled tokens should invoke at least
+            # one bound MoE callback. Dummy/profile setup runs do not call
+            # this method, and zero-token DP executions never install request
+            # spans, so they cannot trigger a false positive here. The final
+            # execution cannot be checked until another execution begins.
+            if (
+                self._active_engine_iteration is not None
+                and self._active_request_token_count
+                and not self._captured_layers
+            ):
+                raise RuntimeError(
+                    "RouterTopKBitmapDumper: no router capture occurred for "
+                    f"engine_iteration={self._active_engine_iteration}"
+                )
+            self._engine_iteration = engine_iteration
+            self._active_engine_iteration = engine_iteration
+            self._active_request_token_count = None
+            self._captured_layers.clear()
 
     def set_request_spans(
         self,
@@ -295,6 +444,15 @@ class RouterTopKBitmapDumper:
         tensor. The runner owns the batch ordering and therefore supplies the
         request spans separately so the dumper can preserve request metadata
         without trying to infer it from expert IDs.
+
+        ``session_id`` and ``turn_id`` are vLLM-observed transport identifiers:
+        ``session_id`` is AIPerf's ``X-Correlation-ID`` and ``turn_id`` is
+        ``X-Request-ID`` (or the explicit internal-request fallback). The
+        AIPerf ``profile_export`` contains these same two IDs alongside the
+        authoritative ``turn_index``, so a post-run join can recover dataset
+        turn numbers without changing AIPerf. ``session_request_ordinal`` is
+        only a deterministic, worker-local ordinal assigned by vLLM; it is not
+        AIPerf's dataset ``turn_index``.
         """
         if len(req_ids) != len(token_counts):
             raise ValueError(
@@ -304,33 +462,61 @@ class RouterTopKBitmapDumper:
 
         spans: list[dict[str, object]] = []
         token_start = 0
-        for req_id, raw_token_count in zip(req_ids, token_counts, strict=True):
-            token_count = int(raw_token_count)
-            if token_count < 0:
-                raise ValueError(
-                    "RouterTopKBitmapDumper: token count cannot be negative"
+        with self._lock:
+            for req_id, raw_token_count in zip(req_ids, token_counts, strict=True):
+                token_count = int(raw_token_count)
+                if token_count < 0:
+                    raise ValueError(
+                        "RouterTopKBitmapDumper: token count cannot be negative"
+                    )
+                headers = request_headers.get(req_id)
+                external_request_id = _header_value(headers, "x-request-id")
+                session_id = _header_value(headers, "x-correlation-id")
+                turn_id = external_request_id or req_id
+                turn_id_source = (
+                    "x-request-id"
+                    if external_request_id is not None
+                    else "internal_request_id_fallback"
                 )
-            headers = request_headers.get(req_id) or {}
-            spans.append(
-                {
-                    "request_id": headers.get("x-request-id", req_id),
-                    "internal_request_id": req_id,
-                    "correlation_id": headers.get("x-correlation-id"),
-                    "token_start": token_start,
-                    "token_count": token_count,
-                }
-            )
-            token_start += token_count
-        self._request_spans = spans
+                session_request_ordinal = None
+                if session_id is not None:
+                    # Prefer the external ID because vLLM appends a random
+                    # suffix to internal request IDs. When the transport does
+                    # not provide X-Request-ID, the internal ID is stable for
+                    # the lifetime of this request and is the only available
+                    # request key.
+                    request_key = external_request_id or req_id
+                    request_ordinals = self._session_request_ordinals[session_id]
+                    session_request_ordinal = request_ordinals.get(request_key)
+                    if session_request_ordinal is None:
+                        session_request_ordinal = self._next_session_request_ordinal[
+                            session_id
+                        ]
+                        self._next_session_request_ordinal[session_id] += 1
+                        request_ordinals[request_key] = session_request_ordinal
+                spans.append(
+                    {
+                        "request_id": external_request_id or req_id,
+                        "internal_request_id": req_id,
+                        "correlation_id": session_id,
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "turn_id_source": turn_id_source,
+                        "session_request_ordinal": session_request_ordinal,
+                        "token_start": token_start,
+                        "token_count": token_count,
+                    }
+                )
+                token_start += token_count
+            self._request_spans = spans
+            self._active_request_token_count = token_start
 
     def _slice_request_spans(self, start: int, end: int) -> list[dict[str, object]]:
         """Clip request spans to the rows written by this worker."""
         if not self._request_spans:
             return []
 
-        source_tokens = sum(
-            int(span["token_count"]) for span in self._request_spans
-        )
+        source_tokens = sum(int(span["token_count"]) for span in self._request_spans)
         captured_tokens = end - start
         if start < 0 or end < start:
             raise AssertionError(
@@ -415,6 +601,17 @@ class RouterTopKBitmapDumper:
     def _slice_topk_ids(self, topk_ids: torch.Tensor) -> torch.Tensor:
         return self._slice_topk_ids_with_bounds(topk_ids)[0]
 
+    def _file_stem(self, layer_id: int) -> str:
+        return (
+            f"role_{_sanitize_filename_component(self.role, 'role')}"
+            f".host_{_sanitize_filename_component(self.hostname, 'hostname')}"
+            f".gpu_{self.physical_gpu_id:03d}"
+            f".rank_{self.rank:03d}"
+            f".local_{self.local_rank:03d}"
+            f".dp_{self.dp_rank:03d}"
+            f".layer_{layer_id:03d}"
+        )
+
     @staticmethod
     def _encode_bitmap_bytes(
         topk_ids_cpu: torch.Tensor,
@@ -461,7 +658,16 @@ class RouterTopKBitmapDumper:
                 "CUDA graph capture; run the metrics path in eager mode"
             )
 
+        # Always slice, on every rank. Under sequence parallelism this issues a
+        # TP all-gather, so a non-writer rank that returned earlier would hang
+        # the TP group. Mark the layer before returning so
+        # ``set_engine_iteration``'s zero-capture guard stays valid here too.
         sliced, start_loc, end_loc = self._slice_topk_ids_with_bounds(topk_ids)
+        with self._lock:
+            self._captured_layers.add(layer_id)
+        if not self.is_writer:
+            return
+
         topk_ids_cpu = sliced.detach().to("cpu", dtype=torch.int64)
         num_tokens = int(topk_ids_cpu.shape[0])
         top_k = int(topk_ids_cpu.shape[1]) if topk_ids_cpu.ndim == 2 else 0
@@ -469,15 +675,16 @@ class RouterTopKBitmapDumper:
         payload = self._encode_bitmap_bytes(topk_ids_cpu, num_logical_experts)
         counts = self._counts(topk_ids_cpu, num_logical_experts)
         request_spans = self._slice_request_spans(start_loc, end_loc)
-        if request_spans and sum(
-            int(span["token_count"]) for span in request_spans
-        ) != num_tokens:
+        if (
+            request_spans
+            and sum(int(span["token_count"]) for span in request_spans) != num_tokens
+        ):
             raise AssertionError(
                 "RouterTopKBitmapDumper: request metadata token count does not "
                 "match captured top-k rows"
             )
 
-        base = f"layer_{layer_id:03d}.rank_{self.rank:03d}"
+        base = self._file_stem(layer_id)
         bitmap_path = self.output_dir / f"{base}.token_expert_bitmap.u64"
         jsonl_path = self.output_dir / f"{base}.jsonl"
 
@@ -492,6 +699,9 @@ class RouterTopKBitmapDumper:
             record = {
                 "rank": self.rank,
                 "local_rank": self.local_rank,
+                "gpu_id": self.physical_gpu_id,
+                "hostname": self.hostname,
+                "dp_rank": self.dp_rank,
                 "role": self.role,
                 "step": step,
                 "engine_iteration": engine_iteration,
@@ -513,6 +723,95 @@ class RouterTopKBitmapDumper:
             }
             with jsonl_path.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
+def bind_router_topk_bitmap_dumper(
+    model: torch.nn.Module,
+    dumper: RouterTopKBitmapDumper,
+) -> int:
+    """Bind *dumper* to every MoE routing path in *model*.
+
+    Modular MoE exposes logical top-k IDs through ``BaseRouter``. Monolithic
+    kernels expose the same IDs only through ``FusedMoEExpertsMonolithic``'s
+    routing-replay callback. Keeping both paths here prevents the legacy and
+    v2 GPU model runners from silently acquiring different coverage.
+    """
+    from vllm.model_executor.layers.fused_moe.layer import MoERunner
+    from vllm.model_executor.layers.fused_moe.modular_kernel import (
+        FusedMoEExpertsMonolithic,
+    )
+    from vllm.model_executor.layers.fused_moe.router.base_router import (
+        BaseRouter,
+    )
+
+    bound_targets = 0
+    for module in model.modules():
+        if not isinstance(module, MoERunner):
+            continue
+
+        layer_id = module.layer_id
+        num_logical_experts = module.moe_config.num_logical_experts
+        quant_method = module._quant_method
+        if quant_method.is_monolithic:
+            moe_kernel = getattr(quant_method, "moe_kernel", None)
+            impl = getattr(moe_kernel, "impl", None)
+            fused_experts = getattr(impl, "fused_experts", None)
+            if not (
+                isinstance(fused_experts, FusedMoEExpertsMonolithic)
+                and fused_experts.supports_routing_replay_capture()
+            ):
+                raise ValueError(
+                    "RouterTopKBitmapDumper cannot bind monolithic MoE kernel "
+                    f"{type(fused_experts).__name__} at layer {layer_id}; "
+                    "routing replay capture is unsupported"
+                )
+
+            previous_capture_fn = getattr(
+                fused_experts, "routing_replay_capture_fn", None
+            )
+
+            def _capture_fn(
+                topk_ids,
+                _layer_id=layer_id,
+                _dumper=dumper,
+                _num_logical_experts=num_logical_experts,
+                _previous_capture_fn=previous_capture_fn,
+            ):
+                if _previous_capture_fn is not None:
+                    _previous_capture_fn(topk_ids)
+                _dumper.capture(_layer_id, topk_ids, _num_logical_experts)
+
+            fused_experts.set_capture_fn(_capture_fn)
+            bound_targets += 1
+            continue
+
+        router = module.router
+        if not isinstance(router, BaseRouter):
+            raise ValueError(
+                "RouterTopKBitmapDumper cannot bind unsupported modular router "
+                f"{type(router).__name__} at layer {layer_id}"
+            )
+        previous_capture_fn = router.capture_fn
+
+        def _capture_fn(
+            topk_ids,
+            _layer_id=layer_id,
+            _dumper=dumper,
+            _num_logical_experts=num_logical_experts,
+            _previous_capture_fn=previous_capture_fn,
+        ):
+            if _previous_capture_fn is not None:
+                _previous_capture_fn(topk_ids)
+            _dumper.capture(_layer_id, topk_ids, _num_logical_experts)
+
+        router.set_capture_fn(_capture_fn)
+        bound_targets += 1
+
+    if bound_targets == 0:
+        raise RuntimeError(
+            "RouterTopKBitmapDumper: zero MoE capture targets were bound"
+        )
+    return bound_targets
 
 
 class RoutedExpertsManager:
