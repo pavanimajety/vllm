@@ -3,14 +3,11 @@
 
 
 import asyncio
-import io
 import time
 from collections.abc import AsyncGenerator
 from collections.abc import Sequence as GenericSequence
 
 import msgspec
-import numpy as np
-import pybase64 as base64
 from fastapi import Request
 
 from vllm.engine.protocol import EngineClient
@@ -46,6 +43,7 @@ from vllm.outputs import RequestOutput
 from vllm.renderers.online_renderer import OnlineRenderer
 from vllm.sampling_params import RequestOutputKind, SamplingParams
 from vllm.utils.collection_utils import as_list
+from vllm.utils.serial_utils import numpy2base64
 
 from .mm_serde import decode_mm_kwargs_item
 from .protocol import (
@@ -139,7 +137,13 @@ class ServingTokens(GenerateBaseServing):
                 f"({max_num_seqs}), got {sampling_params.n}."
             )
         try:
-            msgspec.msgpack.encode(sampling_params)
+            msgspec.msgpack.encode(
+                (
+                    sampling_params,
+                    request.kv_transfer_params,
+                    request.ec_transfer_params,
+                )
+            )
         except (OverflowError, TypeError, ValueError) as e:
             return self.create_error_response(e)
 
@@ -205,6 +209,16 @@ class ServingTokens(GenerateBaseServing):
         # Schedule the request and get the result generator.
         result_generator: AsyncGenerator[RequestOutput, None] | None = None
 
+        # Pass disaggregated-serving parameters through to the engine.
+        if request.kv_transfer_params is not None:
+            extra = sampling_params.extra_args or {}
+            extra["kv_transfer_params"] = request.kv_transfer_params
+            sampling_params.extra_args = extra
+        if request.ec_transfer_params is not None:
+            extra = sampling_params.extra_args or {}
+            extra["ec_transfer_params"] = request.ec_transfer_params
+            sampling_params.extra_args = extra
+
         # Apply server-side ``max_tokens`` defaulting when the client did
         # not set it, matching the OpenAI-compat endpoints. ``SamplingParams``
         # defaults ``max_tokens`` to 16, which would otherwise silently cap
@@ -220,8 +234,9 @@ class ServingTokens(GenerateBaseServing):
 
         if self.force_no_detokenize:
             sampling_params.detokenize = False
-        if request.stream:
-            sampling_params.output_kind = RequestOutputKind.DELTA
+        sampling_params.output_kind = (
+            RequestOutputKind.DELTA if request.stream else RequestOutputKind.FINAL_ONLY
+        )
 
         self._log_inputs(
             request_id,
@@ -289,6 +304,8 @@ class ServingTokens(GenerateBaseServing):
         choices: list[GenerateResponseChoice] = []
         num_generated_tokens = 0
         for output in final_res.outputs:
+            self._raise_if_error(output.finish_reason, request_id)
+
             token_ids = output.token_ids
             out_logprobs = output.logprobs
 
@@ -303,17 +320,15 @@ class ServingTokens(GenerateBaseServing):
             else:
                 logprobs = None
 
-            # Encode routed_experts for transport. JSON can't carry raw
-            # bytes, so we write the ndarray as a ``.npy`` byte stream
-            # and base64-encode it. ``pybase64`` is ~3x faster than the
-            # stdlib ``base64`` on large payloads thanks to SIMD.
-            # This is the only base64 hop in the pipeline -- the
-            # engine<->API-server link is binary msgpack + zmq.
-            routed_experts_b64 = None
-            if output.routed_experts is not None:
-                buf = io.BytesIO()
-                np.save(buf, output.routed_experts)
-                routed_experts_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            routed_experts_b64 = (
+                numpy2base64(output.routed_experts)
+                if output.routed_experts is not None
+                else None
+            )
+
+            sampling_mask = None
+            if output.sampling_mask is not None:
+                sampling_mask = output.sampling_mask.token_ids
 
             choice_data = GenerateResponseChoice(
                 index=output.index,
@@ -321,6 +336,7 @@ class ServingTokens(GenerateBaseServing):
                 finish_reason=output.finish_reason if output.finish_reason else "stop",
                 token_ids=as_list(output.token_ids),
                 routed_experts=routed_experts_b64,
+                sampling_mask=sampling_mask,
             )
 
             choices.append(choice_data)
@@ -430,13 +446,11 @@ class ServingTokens(GenerateBaseServing):
                     else:
                         logprobs = None
 
-                    routed_experts_b64 = None
-                    if output.routed_experts is not None:
-                        buf = io.BytesIO()
-                        np.save(buf, output.routed_experts)
-                        routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
-                            "ascii"
-                        )
+                    routed_experts_b64 = (
+                        numpy2base64(output.routed_experts)
+                        if output.routed_experts is not None
+                        else None
+                    )
 
                     chunk = GenerateStreamResponse(
                         request_id=request_id,

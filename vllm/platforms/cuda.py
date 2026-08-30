@@ -142,11 +142,15 @@ def _get_backend_priorities(
                 AttentionBackendEnum.FLASHMLA_SPARSE,
             ]
     else:
-        # SM100f defaults to FlashInfer for TRTLLM causal attention, but its non-causal
-        # cutlass path (used for dflash attention) is known to have problems.
-        # So prefer FlashAttention when non-causal on SM100f.
+        # SM100f defaults to the direct TRTLLM kernels for causal attention,
+        # falling back to the FlashInfer wrappers when TRTLLM rejects the
+        # configuration (DCP, or a KV/query dtype combination its prefill
+        # kernel cannot serve). TRTLLM's non-causal cutlass path (used for
+        # dflash attention) is known to have problems, so prefer
+        # FlashAttention when non-causal on SM100f.
         if device_capability.major == 10 and not use_non_causal:
             return [
+                AttentionBackendEnum.TRTLLM,
                 AttentionBackendEnum.FLASHINFER,
                 AttentionBackendEnum.FLASH_ATTN,
                 AttentionBackendEnum.TRITON_ATTN,
@@ -228,6 +232,10 @@ class CudaPlatformBase(Platform):
             import vllm._moe_C_stable_libtorch  # noqa: F401
         with contextlib.suppress(ImportError):
             import vllm._qutlass_C  # noqa: F401
+
+    @classmethod
+    def check_runner_kv_caches_multi_layer(cls) -> None:
+        pass
 
     @property
     def supported_dtypes(self) -> list[torch.dtype]:
@@ -382,8 +390,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons_i = ["ImportError"]
+            except (ImportError, OSError) as e:
+                logger.debug(
+                    "Attention backend %s is unavailable", backend.name, exc_info=True
+                )
+                invalid_reasons_i = [f"{type(e).__name__}: {e}"]
             if invalid_reasons_i:
                 invalid_reasons[backend] = (priority, invalid_reasons_i)
             else:
@@ -411,8 +422,11 @@ class CudaPlatformBase(Platform):
                     device_capability=device_capability,
                     **attn_selector_config._asdict(),
                 )
-            except ImportError:
-                invalid_reasons = ["ImportError"]
+            except (ImportError, OSError) as e:
+                raise ValueError(
+                    f"Selected backend {selected_backend} is not valid for "
+                    f"this configuration. Reason: [{type(e).__name__}: {e}]"
+                ) from e
             if invalid_reasons:
                 raise ValueError(
                     f"Selected backend {selected_backend} is not valid for "

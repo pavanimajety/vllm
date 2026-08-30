@@ -29,7 +29,7 @@ from vllm.entrypoints.openai.engine.protocol import (
     FunctionCall,
     FunctionDefinition,
     OpenAIBaseModel,
-    PerRequestTimingMetrics,
+    PerRequestMetrics,
     StopParam,
     StreamOptions,
     ToolCall,
@@ -114,7 +114,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None
     # Per-token expert routing decisions, base64-encoded ``.npy`` bytes
     # (numpy serialization). Shape after decode:
-    #   (num_tokens - 1, num_layers, num_experts_per_tok)  dtype uint8/uint16
+    #   (num_tokens - 1, num_layers, num_experts_per_tok) dtype uint8/uint16/int32
     # ``num_tokens - 1`` because the last sampled token has not been
     # forwarded yet and therefore has no routing data.
     # Decode:
@@ -146,7 +146,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
     ec_transfer_params: dict[str, Any] | None = Field(
         default=None, description="ECTransfer parameters."
     )
-    metrics: PerRequestTimingMetrics | None = None
+    metrics: PerRequestMetrics | None = None
 
 
 class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
@@ -178,7 +178,7 @@ class ChatCompletionStreamResponse(OpenAIBaseModel):
     # Rendered prompt text from chat templating (only set when
     # ``return_prompt_text=True`` on the request); only sent on the first chunk.
     prompt_text: str | None = None
-    metrics: PerRequestTimingMetrics | None = None
+    metrics: PerRequestMetrics | None = None
 
 
 class ChatCompletionToolsParam(OpenAIBaseModel):
@@ -422,6 +422,11 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "need to map generated text back to input tokens."
         ),
     )
+    routed_experts_prompt_start: int = Field(
+        default=0,
+        ge=0,
+        description="Skip the first N prompt tokens from returned routed-expert data.",
+    )
     return_token_offsets: bool | None = Field(
         default=False,
         description=(
@@ -462,6 +467,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     cache_salt: str | None = Field(
         default=None,
         min_length=1,
+        max_length=1024,
         description=(
             "If specified, the prefix cache will be salted with the provided "
             "string to prevent an attacker to guess prompts in multi-user "
@@ -741,6 +747,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
             extra_args=extra_args or None,
             skip_clone=True,  # Created fresh per request, safe to skip clone
             repetition_detection=self.repetition_detection,
+            routed_experts_prompt_start=self.routed_experts_prompt_start,
         )
 
     @model_validator(mode="before")
