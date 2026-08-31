@@ -21,6 +21,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RouterTopKBitmapDumper,
     _resolve_writer_ranks,
     bind_routed_experts_capturer,
+    bind_router_topk_bitmap_dumper,
     get_routed_experts_attn_gid,
 )
 from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
@@ -868,6 +869,29 @@ def test_bitmap_dumper_binds_supported_monolithic_router(monkeypatch):
     assert len(module._test_previous_calls) == 1
     assert len(dumper.calls) == 1
     assert dumper.calls[0][0] == 7
+
+
+def test_bitmap_dumper_binds_dsv4_capture_source_and_preserves_callback():
+    class DSV4MegaMoECaptureSource(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.layer_id = 11
+            self.num_experts = 256
+            self.previous_calls: list[torch.Tensor] = []
+            self.capture_fn = lambda ids: self.previous_calls.append(ids.clone())
+
+    source = DSV4MegaMoECaptureSource()
+    model = torch.nn.Module()
+    model.add_module("experts", source)
+    dumper = _BitmapDumperForBindingTest()
+
+    bind_router_topk_bitmap_dumper(model, dumper)
+    source.capture_fn(torch.tensor([[7, 8]]))
+
+    assert len(source.previous_calls) == 1
+    assert len(dumper.calls) == 1
+    assert dumper.calls[0][0] == 11
+    assert dumper.calls[0][2] == 256
 
 
 def test_bitmap_dumper_rejects_unsupported_monolithic_router(monkeypatch):

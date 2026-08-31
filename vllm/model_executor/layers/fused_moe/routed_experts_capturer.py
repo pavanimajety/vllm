@@ -8,7 +8,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import re
 import socket
 import struct
 import threading
@@ -17,9 +16,10 @@ from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol, TypedDict, runtime_checkable
 
 import numpy as np
+import regex as re
 import torch
 
 from vllm.config import VllmConfig
@@ -36,6 +36,18 @@ logger = logging.getLogger(__name__)
 class RoutedExpertsCaptureSource(Protocol):
     layer_id: int
     capture_fn: Callable[[torch.Tensor], None] | None
+
+
+class _RequestSpan(TypedDict):
+    request_id: str
+    internal_request_id: str
+    correlation_id: str | None
+    session_id: str | None
+    turn_id: str
+    turn_id_source: str
+    session_request_ordinal: int | None
+    token_start: int
+    token_count: int
 
 
 def _resolve_int_env(*names: str) -> int | None:
@@ -112,7 +124,7 @@ def _header_value(
 def _resolve_physical_gpu_id() -> int:
     """Resolve the physical GPU, accounting for visible-device remapping."""
     try:
-        visible_gpu_id = int(torch.cuda.current_device())
+        visible_gpu_id = torch.accelerator.current_device_index()
         physical_gpu_id = current_platform.visible_device_id_to_physical_device_id(
             visible_gpu_id
         )
@@ -403,110 +415,6 @@ def bind_routed_experts_capturer(
         raise ValueError("No supported MoE router found for routed-experts capture.")
 
 
-def bind_router_topk_bitmap_dumper(
-    model: torch.nn.Module,
-    dumper: RouterTopKBitmapDumper,
-) -> None:
-    """Attach diagnostic top-k callbacks to every supported MoE route."""
-    from vllm.model_executor.layers.fused_moe.layer import MoERunner
-    from vllm.model_executor.layers.fused_moe.modular_kernel import (
-        FusedMoEExpertsMonolithic,
-    )
-    from vllm.model_executor.layers.fused_moe.router.base_router import BaseRouter
-
-    num_bound = 0
-    for module in model.modules():
-        if isinstance(module, RoutedExpertsCaptureSource):
-            num_logical_experts = getattr(module, "num_logical_experts", None)
-            if not isinstance(num_logical_experts, int) or num_logical_experts <= 0:
-                raise ValueError(
-                    "Router top-k bitmap capture source must expose a positive "
-                    "num_logical_experts."
-                )
-            previous_capture_fn = module.capture_fn
-
-            def capture_source_fn(
-                topk_ids: torch.Tensor,
-                layer_id: int = module.layer_id,
-                num_logical_experts: int = num_logical_experts,
-                previous_capture_fn: Callable[[torch.Tensor], None] | None = (
-                    previous_capture_fn
-                ),
-            ) -> None:
-                if previous_capture_fn is not None:
-                    previous_capture_fn(topk_ids)
-                dumper.capture(layer_id, topk_ids, num_logical_experts)
-
-            module.capture_fn = capture_source_fn
-            num_bound += 1
-            continue
-
-        if not isinstance(module, MoERunner):
-            continue
-        layer_id = module.layer_id
-        num_logical_experts = module.moe_config.num_logical_experts
-
-        def capture_fn(
-            topk_ids: torch.Tensor,
-            layer_id: int = layer_id,
-            num_logical_experts: int = num_logical_experts,
-        ) -> None:
-            dumper.capture(layer_id, topk_ids, num_logical_experts)
-
-        quant_method = module._quant_method
-        moe_kernel = getattr(quant_method, "moe_kernel", None)
-        impl = getattr(moe_kernel, "impl", None)
-        fused_experts = getattr(impl, "fused_experts", None)
-        if quant_method.is_monolithic:
-            if not (
-                isinstance(fused_experts, FusedMoEExpertsMonolithic)
-                and fused_experts.supports_routing_replay_capture()
-            ):
-                raise ValueError(
-                    "Router top-k bitmap capture is not supported with monolithic "
-                    f"MoE kernel {type(fused_experts).__name__}."
-                )
-            previous_capture_fn = fused_experts.routing_replay_capture_fn
-
-            def monolithic_capture_fn(
-                topk_ids: torch.Tensor,
-                capture_fn: Callable[[torch.Tensor], None] = capture_fn,
-                previous_capture_fn: Callable[[torch.Tensor], None] | None = (
-                    previous_capture_fn
-                ),
-            ) -> None:
-                if previous_capture_fn is not None:
-                    previous_capture_fn(topk_ids)
-                capture_fn(topk_ids)
-
-            fused_experts.set_capture_fn(monolithic_capture_fn)
-            num_bound += 1
-        elif isinstance(module.router, BaseRouter):
-            previous_capture_fn = module.router.capture_fn
-
-            def modular_capture_fn(
-                topk_ids: torch.Tensor,
-                capture_fn: Callable[[torch.Tensor], None] = capture_fn,
-                previous_capture_fn: Callable[[torch.Tensor], None] | None = (
-                    previous_capture_fn
-                ),
-            ) -> None:
-                if previous_capture_fn is not None:
-                    previous_capture_fn(topk_ids)
-                capture_fn(topk_ids)
-
-            module.router.set_capture_fn(modular_capture_fn)
-            num_bound += 1
-        else:
-            raise ValueError(
-                "Router top-k bitmap capture is not supported with router "
-                f"{type(module.router).__name__}."
-            )
-
-    if num_bound == 0:
-        raise ValueError("No supported MoE router found for top-k bitmap capture.")
-
-
 def get_routed_experts_attn_gid(kv_cache_config: KVCacheConfig) -> int:
     """Return the full-attention KV cache group used for routed experts."""
     for gid, group in enumerate(kv_cache_config.kv_cache_groups):
@@ -532,7 +440,7 @@ class RouterTopKBitmapDumper:
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
         self.rank = _resolve_int_env("RANK", "SLURM_PROCID")
         self.local_rank = _resolve_int_env("LOCAL_RANK", "SLURM_LOCALID")
-        self.role = os.environ.get("VLLM_ROUTER_TOPK_BITMAP_ROLE")
+        role = os.environ.get("VLLM_ROUTER_TOPK_BITMAP_ROLE")
         self.hostname = socket.gethostname()
         self.physical_gpu_id = _resolve_physical_gpu_id()
 
@@ -550,7 +458,7 @@ class RouterTopKBitmapDumper:
             raise RuntimeError(
                 "RouterTopKBitmapDumper: a non-negative data-parallel rank is required"
             )
-        if not self.role:
+        if not role:
             raise RuntimeError(
                 "RouterTopKBitmapDumper: VLLM_ROUTER_TOPK_BITMAP_ROLE is required"
             )
@@ -562,6 +470,7 @@ class RouterTopKBitmapDumper:
         self.rank = int(self.rank)
         self.local_rank = int(self.local_rank)
         self.dp_rank = int(self.dp_rank)
+        self.role = role
         _sanitize_filename_component(self.role, "role")
         _sanitize_filename_component(self.hostname, "hostname")
 
@@ -578,7 +487,7 @@ class RouterTopKBitmapDumper:
         self._active_engine_iteration: int | None = None
         self._active_request_token_count: int | None = None
         self._captured_layers: set[int] = set()
-        self._request_spans: list[dict[str, object]] = []
+        self._request_spans: list[_RequestSpan] = []
         self._session_request_ordinals: dict[str, dict[str, int]] = defaultdict(dict)
         self._next_session_request_ordinal: dict[str, int] = defaultdict(int)
         logger.info(
@@ -645,7 +554,7 @@ class RouterTopKBitmapDumper:
                 "the same length"
             )
 
-        spans: list[dict[str, object]] = []
+        spans: list[_RequestSpan] = []
         token_start = 0
         with self._lock:
             for req_id, raw_token_count in zip(req_ids, token_counts, strict=True):
@@ -696,7 +605,7 @@ class RouterTopKBitmapDumper:
             self._request_spans = spans
             self._active_request_token_count = token_start
 
-    def _slice_request_spans(self, start: int, end: int) -> list[dict[str, object]]:
+    def _slice_request_spans(self, start: int, end: int) -> list[_RequestSpan]:
         """Clip request spans to the rows written by this worker."""
         if not self._request_spans:
             return []
@@ -723,7 +632,7 @@ class RouterTopKBitmapDumper:
                 f"metadata_tokens={source_tokens})"
             )
 
-        clipped: list[dict[str, object]] = []
+        clipped: list[_RequestSpan] = []
         for span in self._request_spans:
             span_start = int(span["token_start"])
             span_end = span_start + int(span["token_count"])
@@ -731,7 +640,7 @@ class RouterTopKBitmapDumper:
             overlap_end = min(end, span_end)
             if overlap_start >= overlap_end:
                 continue
-            clipped_span = dict(span)
+            clipped_span = span.copy()
             clipped_span["token_start"] = overlap_start - start
             clipped_span["token_count"] = overlap_end - overlap_start
             clipped.append(clipped_span)
@@ -931,6 +840,37 @@ def bind_router_topk_bitmap_dumper(
 
     bound_targets = 0
     for module in model.modules():
+        if isinstance(module, RoutedExpertsCaptureSource):
+            # DeepSeek-V4 MegaMoE exposes its logical expert count as
+            # ``num_experts``; standard MoE runners use
+            # ``num_logical_experts``. Both names refer to the pre-EPLB
+            # routing domain at this capture point.
+            num_logical_experts = getattr(module, "num_logical_experts", None)
+            if num_logical_experts is None:
+                num_logical_experts = getattr(module, "num_experts", None)
+            if not isinstance(num_logical_experts, int) or num_logical_experts <= 0:
+                raise ValueError(
+                    "RouterTopKBitmapDumper capture source must expose a positive "
+                    "num_logical_experts or num_experts"
+                )
+            layer_id = module.layer_id
+            previous_capture_fn = module.capture_fn
+
+            def _capture_source_fn(
+                topk_ids,
+                _layer_id=layer_id,
+                _dumper=dumper,
+                _num_logical_experts=num_logical_experts,
+                _previous_capture_fn=previous_capture_fn,
+            ):
+                if _previous_capture_fn is not None:
+                    _previous_capture_fn(topk_ids)
+                _dumper.capture(_layer_id, topk_ids, _num_logical_experts)
+
+            module.capture_fn = _capture_source_fn
+            bound_targets += 1
+            continue
+
         if not isinstance(module, MoERunner):
             continue
 
