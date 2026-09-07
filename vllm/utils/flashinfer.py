@@ -16,6 +16,7 @@ from typing import Any, NoReturn
 
 import requests
 import torch
+from packaging.version import Version
 
 import vllm.envs as envs
 from vllm.logger import init_logger
@@ -68,6 +69,12 @@ def has_flashinfer_cubin() -> bool:
 @functools.cache
 def has_flashinfer() -> bool:
     """Return `True` if flashinfer-python package is available."""
+    if current_platform.is_cuda():
+        capability = current_platform.get_device_capability()
+        assert capability is not None, "CUDA capability can't be None"
+        if capability.major == 12 and Version(torch.version.cuda) < Version("12.9"):
+            return False
+
     # Use find_spec to check if the module exists without importing it
     # This avoids potential CUDA initialization side effects
     if importlib.util.find_spec("flashinfer") is None:
